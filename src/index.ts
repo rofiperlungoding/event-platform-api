@@ -1,5 +1,6 @@
+import 'dotenv/config';
 import Fastify from 'fastify';
-import { PrismaClient, Prisma } from '@prisma/client';
+import { PrismaClient, Prisma } from './generated/prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { z } from 'zod';
 
@@ -9,7 +10,15 @@ const app = Fastify({
   },
 });
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+// Driver adapter — bypasses native binary, works on Android/Termux too
+const dbUrl = new URL(process.env.DATABASE_URL!);
+const adapter = new PrismaPg({
+  host: dbUrl.hostname,
+  port: Number(dbUrl.port || 5432),
+  user: decodeURIComponent(dbUrl.username),
+  password: decodeURIComponent(dbUrl.password),
+  database: dbUrl.pathname.slice(1),
+});
 const prisma = new PrismaClient({ adapter });
 
 // ─── Schemas ────────────────────────────────────────────────────────────────
