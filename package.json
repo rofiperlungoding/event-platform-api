@@ -16,6 +16,7 @@
     "db:logs": "docker compose logs -f db"
   },
   "dependencies": {
+    "@fastify/cors": "^11.2.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^6.1.0",
     "@types/pg": "^8.20.0",

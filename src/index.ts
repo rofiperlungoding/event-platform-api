@@ -1,8 +1,10 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
+import cors from '@fastify/cors';
 import { PrismaClient, Prisma } from './generated/prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { z } from 'zod';
+import { registerSystemRoutes } from './routes/system';
 
 const app = Fastify({
   logger: {
@@ -21,6 +23,12 @@ const adapter = new PrismaPg({
 });
 const prisma = new PrismaClient({ adapter });
 
+// CORS — allow frontend on different origin
+app.register(cors, {
+  origin: true, // reflect request origin
+  credentials: true,
+});
+
 // ─── Schemas ────────────────────────────────────────────────────────────────
 const RegisterSchema = z.object({
   name: z.string().min(2).max(100),
@@ -33,6 +41,22 @@ const ParamsIdSchema = z.object({
 });
 
 // ─── Routes ─────────────────────────────────────────────────────────────────
+app.get('/', async () => ({
+  service: 'event-platform-api',
+  version: '0.1.0',
+  endpoints: [
+    'GET    /health',
+    'GET    /health/detailed',
+    'GET    /system',
+    'GET    /stats/database',
+    'GET    /stats/participants',
+    'GET    /participants',
+    'GET    /participants/:id',
+    'POST   /register',
+    'DELETE /participants/:id',
+  ],
+}));
+
 app.get('/health', async () => ({ status: 'ok', uptime: process.uptime() }));
 
 app.get('/participants', async () => {
@@ -77,6 +101,9 @@ app.delete('/participants/:id', async (req, reply) => {
     throw err;
   }
 });
+
+// System / stats / detailed-health endpoints
+registerSystemRoutes(app, prisma);
 
 // ─── Bootstrap ──────────────────────────────────────────────────────────────
 const port = Number(process.env.PORT ?? 3000);
