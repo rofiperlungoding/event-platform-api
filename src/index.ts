@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import { PrismaClient, Prisma } from '@prisma/client';
+import { PrismaPg } from '@prisma/adapter-pg';
 import { z } from 'zod';
 
 const app = Fastify({
@@ -8,7 +9,8 @@ const app = Fastify({
   },
 });
 
-const prisma = new PrismaClient();
+const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+const prisma = new PrismaClient({ adapter });
 
 // ─── Schemas ────────────────────────────────────────────────────────────────
 const RegisterSchema = z.object({
