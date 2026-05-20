@@ -38,7 +38,9 @@ if [ -z "${PREFIX:-}" ] || [ ! -d "/data/data/com.termux" ]; then
 fi
 
 # Pastikan storage cukup (minimal 2GB free)
-FREE_MB=$(df -m "$PREFIX" | awk 'NR==2 {print $4}')
+# Pakai POSIX df -k (KB) supaya kompat busybox di Termux
+FREE_KB=$(df -k "$PREFIX" | awk 'NR==2 {print $4}')
+FREE_MB=$((FREE_KB / 1024))
 if [ "$FREE_MB" -lt 2048 ]; then
   warn "Storage Termux cuma ${FREE_MB}MB free. Disarankan minimal 2GB."
   if [ -t 0 ]; then
