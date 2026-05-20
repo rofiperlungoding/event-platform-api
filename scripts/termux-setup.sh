@@ -41,7 +41,11 @@ fi
 FREE_MB=$(df -m "$PREFIX" | awk 'NR==2 {print $4}')
 if [ "$FREE_MB" -lt 2048 ]; then
   warn "Storage Termux cuma ${FREE_MB}MB free. Disarankan minimal 2GB."
-  read -rp "Lanjutkan? (y/N) " confirm
+  if [ -t 0 ]; then
+    read -rp "Lanjutkan? (y/N) " confirm
+  else
+    read -rp "Lanjutkan? (y/N) " confirm < /dev/tty
+  fi
   [ "$confirm" = "y" ] || exit 1
 fi
 
