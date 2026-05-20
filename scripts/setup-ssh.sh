@@ -19,7 +19,7 @@ echo ""
 echo "Lo bakal diminta password baru 2x. INI password buat SSH login dari laptop."
 echo "Pilih password yang lo INGAT, atau tulis di notes."
 echo ""
-passwd
+passwd < /dev/tty
 ok "Password set"
 
 log "3/4 — Start sshd"
