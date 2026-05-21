@@ -1,12 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Auto-deploy script for event-platform-api
 # Triggered by GitHub webhook → C server → this script
-#
-# Steps:
-#   1. git pull
-#   2. recompile server2.c
-#   3. atomic swap binary (rename)
-#   4. pm2 restart event-server
+
+# Reset SIGCHLD handler (parent server has SIG_IGN which breaks git pull)
+trap - CHLD
 
 set -e
 

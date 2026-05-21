@@ -941,7 +941,8 @@ static void handle_deploy_webhook(int fd, const char *headers, const char *body,
     /* Fork detached child to run deploy script (don't block response) */
     pid_t pid = fork();
     if (pid == 0) {
-        /* Child: detach, run deploy */
+        /* Child: detach, reset signal handlers, run deploy */
+        signal(SIGCHLD, SIG_DFL);  /* Allow waitpid in child shell */
         setsid();
         int devnull = open("/dev/null", O_RDWR);
         dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2);
