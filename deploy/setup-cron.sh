@@ -27,9 +27,11 @@ else
     echo "Cron jobs already in place."
 fi
 
-# Start crond if not running (setsid so it survives parent exit)
-pgrep crond > /dev/null || setsid crond -L $HOME/cron.log < /dev/null > /dev/null 2>&1 &
-
+# Start crond if not running (background, no -L flag for cronie)
+pgrep crond > /dev/null || nohup crond < /dev/null > $HOME/cron.log 2>&1 &
+sleep 1
+echo ""
+echo "Cron daemon: $(pgrep -af crond | head -1)"
 echo ""
 echo "Active cron jobs:"
 crontab -l
