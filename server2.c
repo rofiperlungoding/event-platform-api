@@ -946,6 +946,7 @@ static void handle_deploy_webhook(int fd, const char *headers, const char *body,
         if (strcmp(name, "setup-cron") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/setup-cron.sh";
         else if (strcmp(name, "db-backup") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/db-backup.sh";
         else if (strcmp(name, "status-check") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/status-check.sh";
+        else if (strcmp(name, "full-status") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/full-status.sh";
         else if (strcmp(name, "debug-cron") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/debug-cron.sh";
         else if (strcmp(name, "install-boot") == 0) {
             /* Inline command: copy boot-script.sh to ~/.termux/boot/ and chmod +x */
