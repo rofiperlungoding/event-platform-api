@@ -10,3 +10,8 @@ src/generated
 .idea
 .vscode/*
 !.vscode/extensions.json
+
+# Build artifacts (built on tab, not in repo)
+event-server*
+*.bak
+console/
