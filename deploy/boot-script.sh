@@ -16,11 +16,16 @@ sleep 4
 pkill sshd 2>/dev/null
 sshd
 
-# Start cron daemon
+# Start cron daemon (for watchdog + backups)
 pgrep crond > /dev/null || nohup crond < /dev/null > $HOME/cron.log 2>&1 &
 
 # Resurrect pm2 processes (event-server + event-tunnel)
 pm2 resurrect
 
-# Log boot completion
-echo "[$(date)] Boot stack started" >> $HOME/boot.log
+# Wait for boot to settle, then verify health
+sleep 15
+if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
+    echo "[$(date)] Boot stack started: HEALTHY" >> $HOME/boot.log
+else
+    echo "[$(date)] Boot stack started: UNHEALTHY — watchdog will retry" >> $HOME/boot.log
+fi

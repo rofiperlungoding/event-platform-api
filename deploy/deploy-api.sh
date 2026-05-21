@@ -1,49 +1,93 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Auto-deploy script for event-platform-api
 # Triggered by GitHub webhook → C server → this script
+#
+# DEFENSE-IN-DEPTH:
+#   1. git pull
+#   2. compile to staging name
+#   3. smoke test (run binary on test port, curl /health)
+#   4. ONLY if healthy: rotate binaries (keep last 5) + atomic swap + restart
+#   5. If anything fails: keep current binary running
 
-# Reset SIGCHLD handler (parent server has SIG_IGN which breaks git pull)
 trap - CHLD
-
 set -e
 
 REPO_DIR="$HOME/projects/event-platform-api"
 BUILD_DIR="$HOME/projects/event-platform-zig"
+BIN_DIR="$HOME/projects"
+ARCHIVE="$HOME/projects/event-server-archive"
 LOG="$HOME/deploy-api.log"
+
+mkdir -p "$ARCHIVE"
 
 echo "[$(date)] === API DEPLOY START ===" >> "$LOG"
 
 cd "$REPO_DIR"
 
-# Pull latest
+# 1. Pull
 echo "[$(date)] Pulling..." >> "$LOG"
 git fetch origin >> "$LOG" 2>&1
 git reset --hard origin/main >> "$LOG" 2>&1
 COMMIT=$(git rev-parse --short HEAD)
 echo "[$(date)] On commit: $COMMIT" >> "$LOG"
 
-# Copy server2.c to build dir (where libpq paths are set up)
+# 2. Compile to staging
 cp server2.c "$BUILD_DIR/server2.c"
 cd "$BUILD_DIR"
-
-# Compile new version
 echo "[$(date)] Compiling..." >> "$LOG"
-if cc -O2 -o event-server-new server2.c \
+if ! cc -O2 -o event-server-staging server2.c \
     -I/data/data/com.termux/files/usr/include \
     -L/data/data/com.termux/files/usr/lib \
     -lpq >> "$LOG" 2>&1; then
-    echo "[$(date)] Compile OK" >> "$LOG"
+    echo "[$(date)] ❌ COMPILE FAILED — keeping old binary" >> "$LOG"
+    rm -f event-server-staging
+    exit 1
+fi
+echo "[$(date)] ✓ Compile OK" >> "$LOG"
+
+# 3. Smoke test on test port (3099)
+echo "[$(date)] Smoke testing on port 3099..." >> "$LOG"
+PORT=3099 \
+DATABASE_URL="postgresql://rofi:devsecret@localhost:5432/eventplatform" \
+STATIC_DIR="$HOME/projects/event-platform-console" \
+JWT_SECRET="${JWT_SECRET:-intrivia2026secret}" \
+WEBHOOK_SECRET="${WEBHOOK_SECRET:-intriviadeploy2026}" \
+nohup ./event-server-staging > /dev/null 2>&1 &
+TEST_PID=$!
+sleep 2
+
+if curl -sf http://localhost:3099/health > /dev/null 2>&1; then
+    echo "[$(date)] ✓ Smoke test passed" >> "$LOG"
+    kill -9 $TEST_PID 2>/dev/null
+    sleep 1
 else
-    echo "[$(date)] COMPILE FAILED — keeping old binary" >> "$LOG"
+    echo "[$(date)] ❌ SMOKE TEST FAILED — keeping old binary" >> "$LOG"
+    kill -9 $TEST_PID 2>/dev/null
+    rm -f event-server-staging
     exit 1
 fi
 
-# Atomic swap
-mv event-server-new "$HOME/projects/event-server.new"
-mv "$HOME/projects/event-server.new" "$HOME/projects/event-server"
+# 4. Archive current binary (rotate, keep last 5)
+if [ -f "$BIN_DIR/event-server" ]; then
+    ARCHIVE_NAME="$ARCHIVE/event-server-$(date +%Y%m%d_%H%M%S)"
+    cp "$BIN_DIR/event-server" "$ARCHIVE_NAME"
+    echo "[$(date)] Archived current to $ARCHIVE_NAME" >> "$LOG"
+fi
+# Rotate: keep only last 5
+ls -t "$ARCHIVE"/event-server-* 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null
 
-# Restart
-echo "[$(date)] Restarting pm2..." >> "$LOG"
-pm2 restart event-server >> "$LOG" 2>&1
+# 5. Atomic swap + restart
+mv event-server-staging "$BIN_DIR/event-server"
+echo "[$(date)] Atomic swap done" >> "$LOG"
 
-echo "[$(date)] === DEPLOY DONE ($COMMIT) ===" >> "$LOG"
+pm2 restart event-server --update-env >> "$LOG" 2>&1
+sleep 3
+
+# Final health check on real port
+PORT_RUNNING=$(pm2 jlist 2>/dev/null | grep -o '"PORT":"[0-9]*"' | head -1 | grep -o '[0-9]*')
+PORT_RUNNING=${PORT_RUNNING:-3001}
+if curl -sf "http://localhost:$PORT_RUNNING/health" > /dev/null 2>&1; then
+    echo "[$(date)] ✓✓✓ DEPLOY SUCCESS ($COMMIT) — server healthy on port $PORT_RUNNING ✓✓✓" >> "$LOG"
+else
+    echo "[$(date)] ⚠️ Server unhealthy after deploy — consider rollback" >> "$LOG"
+fi

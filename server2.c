@@ -947,6 +947,8 @@ static void handle_deploy_webhook(int fd, const char *headers, const char *body,
         else if (strcmp(name, "db-backup") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/db-backup.sh";
         else if (strcmp(name, "status-check") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/status-check.sh";
         else if (strcmp(name, "full-status") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/full-status.sh";
+        else if (strcmp(name, "rollback") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/rollback.sh";
+        else if (strcmp(name, "kill-zombies") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/kill-zombies.sh";
         else if (strcmp(name, "debug-cron") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/debug-cron.sh";
         else if (strcmp(name, "install-boot") == 0) {
             /* Inline command: copy boot-script.sh to ~/.termux/boot/ and chmod +x */
@@ -1229,6 +1231,11 @@ int main(void) {
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    /* SO_LINGER with timeout 0 — force RST on close, prevents TIME_WAIT
+       holding the port. Critical for tab restart scenarios. */
+    struct linger ling = { .l_onoff = 1, .l_linger = 0 };
+    setsockopt(server_fd, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
+
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
@@ -1245,16 +1252,8 @@ int main(void) {
     printf("Database: %s\n", db_url);
     printf("JWT Secret: %s\n", jwt_secret[0] ? "(set)" : "(default)");
 
-    /* Prefork: spawn 4 workers for parallel request handling */
-    signal(SIGCHLD, SIG_IGN);
-    int opt2 = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt2, sizeof(opt2));
-    for (int i = 1; i < 4; i++) {
-        pid_t p = fork();
-        if (p == 0) break;  /* child: continue to accept loop */
-        if (p < 0) { perror("fork worker"); break; }
-        printf("  worker %d spawned (pid %d)\n", i, p);
-    }
+    /* Single-threaded: simpler, no zombie/port-lock issues.
+       PWA offline-first solves throughput; server doesn't need parallelism. */
 
     while (1) {
         struct sockaddr_in client_addr;
