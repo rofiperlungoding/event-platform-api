@@ -927,12 +927,30 @@ static void handle_deploy_webhook(int fd, const char *headers, const char *body,
         return;
     }
 
-    /* Determine which repo from path: /deploy/api or /deploy/console */
+    /* Determine which repo from path: /deploy/api or /deploy/console or /deploy/run/<script> */
     const char *script;
-    if (strstr(path, "/deploy/api")) {
+    if (strstr(path, "/deploy/api?")) {
         script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/deploy-api.sh";
-    } else if (strstr(path, "/deploy/console")) {
+    } else if (strstr(path, "/deploy/console?")) {
         script = "/data/data/com.termux/files/home/projects/event-platform-console/deploy.sh";
+    } else if (strstr(path, "/deploy/run/")) {
+        /* Allowlist scripts that can be run via webhook */
+        const char *p = strstr(path, "/deploy/run/") + 12;
+        const char *end = strchr(p, '?');
+        char name[64] = {0};
+        int n = end ? (int)(end - p) : (int)strlen(p);
+        if (n <= 0 || n >= (int)sizeof(name)) { send_json(fd, 400, "Bad Request", "{\"error\":\"invalid script name\"}"); return; }
+        memcpy(name, p, n); name[n] = 0;
+        /* Only allow these specific scripts (security) */
+        static char buf[256];
+        if (strcmp(name, "setup-cron") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/setup-cron.sh";
+        else if (strcmp(name, "db-backup") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/db-backup.sh";
+        else if (strcmp(name, "install-boot") == 0) {
+            /* Inline command: copy boot-script.sh to ~/.termux/boot/ and chmod +x */
+            snprintf(buf, sizeof(buf), "%s/projects/event-platform-api/deploy/install-boot.sh", getenv("HOME"));
+            script = buf;
+        }
+        else { send_json(fd, 403, "Forbidden", "{\"error\":\"script not in allowlist\"}"); return; }
     } else {
         send_json(fd, 404, "Not Found", "{\"error\":\"unknown deploy target\"}");
         return;
@@ -953,8 +971,11 @@ static void handle_deploy_webhook(int fd, const char *headers, const char *body,
 
     /* Parent: respond immediately */
     char resp[256];
-    snprintf(resp, sizeof(resp), "{\"status\":\"deploy triggered\",\"target\":\"%s\",\"pid\":%d}",
-        strstr(path, "/deploy/api") ? "api" : "console", pid);
+    const char *target = "unknown";
+    if (strstr(path, "/deploy/api?")) target = "api";
+    else if (strstr(path, "/deploy/console?")) target = "console";
+    else if (strstr(path, "/deploy/run/")) target = "script";
+    snprintf(resp, sizeof(resp), "{\"status\":\"deploy triggered\",\"target\":\"%s\",\"pid\":%d}", target, pid);
     send_json(fd, 202, "Accepted", resp);
 }
 
