@@ -16,6 +16,9 @@ sleep 4
 pkill sshd 2>/dev/null
 sshd
 
+# Start cron daemon
+pgrep crond > /dev/null || setsid crond -L $HOME/cron.log < /dev/null > /dev/null 2>&1 &
+
 # Resurrect pm2 processes (event-server + event-tunnel)
 pm2 resurrect
 

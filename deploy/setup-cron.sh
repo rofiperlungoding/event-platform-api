@@ -2,6 +2,8 @@
 # Setup cron jobs on tablet
 # Run once: bash setup-cron.sh
 
+trap - CHLD
+
 # Install cron if not already
 pkg install -y cronie >/dev/null 2>&1 || true
 
@@ -25,8 +27,8 @@ else
     echo "Cron jobs already in place."
 fi
 
-# Start crond if not running
-pgrep crond > /dev/null || crond -L $HOME/cron.log
+# Start crond if not running (setsid so it survives parent exit)
+pgrep crond > /dev/null || setsid crond -L $HOME/cron.log < /dev/null > /dev/null 2>&1 &
 
 echo ""
 echo "Active cron jobs:"
