@@ -787,7 +787,7 @@ static void handle_session_create(int fd, const char *headers) {
     char id_str[16], expiry_str[32];
     snprintf(id_str, sizeof(id_str), "%d", user_id);
     time_t exp_time = time(NULL) + SESSION_EXPIRY;
-    struct tm *tm = gmtime(&exp_time);
+    struct tm *tm = localtime(&exp_time);
     strftime(expiry_str, sizeof(expiry_str), "%Y-%m-%d %H:%M:%S", tm);
 
     const char *params[3] = { code, id_str, expiry_str };
