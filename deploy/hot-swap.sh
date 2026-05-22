@@ -13,8 +13,10 @@ echo "[$(date)] hot-swap: building" >> "$LOG"
 cc -O2 -o event-server-staging server.c \
     -I"$PREFIX/include" -L"$PREFIX/lib" -lpq >> "$LOG" 2>&1
 
-# Smoke test: bind random port, hit /health, kill
+# Smoke test: bind random port, hit /health, kill. WORKERS=1 means
+# the smoke binary is single-process so kill cleans up perfectly.
 SMOKE_PORT=4099
+WORKERS=1 \
 PORT=$SMOKE_PORT \
 DATABASE_URL="postgresql://rofi:devsecret@localhost:5432/eventplatform" \
 JWT_SECRET="intrivia2026secret" \
@@ -25,11 +27,14 @@ SMOKE_PID=$!
 sleep 2
 if ! curl -sf "http://localhost:$SMOKE_PORT/health" > /dev/null; then
     echo "[$(date)] hot-swap: smoke test FAILED" >> "$LOG"
-    kill "$SMOKE_PID" 2>/dev/null || true
+    kill -TERM "$SMOKE_PID" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f event-server-staging 2>/dev/null || true
     exit 1
 fi
-kill "$SMOKE_PID" 2>/dev/null || true
+kill -TERM "$SMOKE_PID" 2>/dev/null || true
 sleep 1
+pkill -9 -f event-server-staging 2>/dev/null || true
 
 # Atomic swap: stop pm2, replace binary, start with env
 pm2 delete event-server 2>/dev/null || true

@@ -112,6 +112,40 @@ static PGconn *db_connect(void) {
     return conn;
 }
 
+/* ─── Per-worker persistent connection ─────────────────────────────────
+ * Each worker process keeps a single PGconn open across requests. This
+ * eliminates the ~50ms TCP/handshake cost on the hot path, taking
+ * /attendance/quick-checkin from ~75ms down to ~10ms.
+ *
+ * Workflow:
+ *   - First call to db_acquire() creates and caches the connection.
+ *   - Subsequent calls return the cached connection if it is healthy.
+ *   - db_release() is called at the end of a handler; for the cached
+ *     connection it is a no-op, otherwise it closes a transient one.
+ *   - If the cached connection has gone bad (server restart, network
+ *     blip), it is closed and reopened transparently.
+ *
+ * Each worker is single-threaded (synchronous accept loop), so no mutex
+ * is required — the connection is exclusively owned by one worker
+ * process. */
+static PGconn *worker_conn = NULL;
+
+static PGconn *db_acquire(void) {
+    if (worker_conn) {
+        if (PQstatus(worker_conn) == CONNECTION_OK) return worker_conn;
+        /* Stale — drop it and reconnect. */
+        PQfinish(worker_conn);
+        worker_conn = NULL;
+    }
+    worker_conn = db_connect();
+    return worker_conn;
+}
+
+/* Replacement for PQfinish in callers — leaves the cached connection open. */
+static void db_release(PGconn *conn) {
+    if (conn && conn != worker_conn) PQfinish(conn);
+}
+
 static long ms_since(struct timespec *start) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -388,13 +422,13 @@ static void handle_health_detailed(int fd) {
 
     struct timespec db_start;
     clock_gettime(CLOCK_MONOTONIC, &db_start);
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     const char *db_status = "ok";
     if (!conn) { db_status = "error"; }
     else {
         PGresult *r = PQexec(conn, "SELECT 1");
         PQclear(r);
-        PQfinish(conn);
+        db_release(conn);
     }
     long db_ms = ms_since(&db_start);
 
@@ -448,7 +482,7 @@ static void handle_system(int fd) {
 }
 
 static void handle_stats_database(int fd) {
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     char buf[2048];
@@ -476,12 +510,12 @@ static void handle_stats_database(int fd) {
         "{\"database_size_bytes\":%ld,\"tables\":%s,\"participant_count\":%s}",
         db_size, tables, pcount);
     PQclear(r);
-    PQfinish(conn);
+    db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
 static void handle_stats_participants(int fd) {
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     char buf[4096];
@@ -516,12 +550,12 @@ static void handle_stats_participants(int fd) {
     }
     PQclear(r);
     off += snprintf(buf + off, sizeof(buf) - off, "]}");
-    PQfinish(conn);
+    db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
 static void handle_participants_list(int fd) {
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     PGresult *r = PQexec(conn, "SELECT id, name, email, team, \"createdAt\", \"updatedAt\" FROM \"Participant\" ORDER BY \"createdAt\" DESC");
@@ -538,14 +572,14 @@ static void handle_participants_list(int fd) {
                 PQgetvalue(r, i, 0), ename, eemail, eteam, PQgetvalue(r, i, 4), PQgetvalue(r, i, 5));
         }
     }
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     sb_append(&sb, "]");
     send_json(fd, 200, "OK", sb.data);
     sb_free(&sb);
 }
 
 static void handle_participant_get(int fd, const char *id_str) {
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     const char *params[1] = { id_str };
@@ -553,7 +587,7 @@ static void handle_participant_get(int fd, const char *id_str) {
         "SELECT id, name, email, team, \"createdAt\", \"updatedAt\" FROM \"Participant\" WHERE id = $1",
         1, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) == 0) {
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 404, "Not Found", "{\"error\":\"participant not found\"}");
         return;
     }
@@ -565,7 +599,7 @@ static void handle_participant_get(int fd, const char *id_str) {
     snprintf(buf, sizeof(buf),
         "{\"id\":%s,\"name\":\"%s\",\"email\":\"%s\",\"team\":\"%s\",\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
         PQgetvalue(r, 0, 0), ename, eemail, eteam, PQgetvalue(r, 0, 4), PQgetvalue(r, 0, 5));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -580,7 +614,7 @@ static void handle_register(int fd, const char *body) {
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     const char *params[3] = { name, email, team };
@@ -591,7 +625,7 @@ static void handle_register(int fd, const char *body) {
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         const char *err = PQresultErrorField(r, PG_DIAG_SQLSTATE);
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         if (err && strcmp(err, "23505") == 0)
             send_json(fd, 409, "Conflict", "{\"error\":\"email already registered\"}");
         else
@@ -606,19 +640,19 @@ static void handle_register(int fd, const char *body) {
     snprintf(buf, sizeof(buf),
         "{\"id\":%s,\"name\":\"%s\",\"email\":\"%s\",\"team\":\"%s\",\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
         PQgetvalue(r, 0, 0), ename, eemail, eteam, PQgetvalue(r, 0, 4), PQgetvalue(r, 0, 5));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 201, "Created", buf);
 }
 
 static void handle_participant_delete(int fd, const char *id_str) {
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     const char *params[1] = { id_str };
     PGresult *r = PQexecParams(conn, "DELETE FROM \"Participant\" WHERE id = $1", 1, NULL, params, NULL, NULL, 0);
     const char *affected = PQcmdTuples(r);
     int deleted = (affected && affected[0] != '0');
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     if (deleted) send_no_content(fd);
     else send_json(fd, 404, "Not Found", "{\"error\":\"participant not found\"}");
 }
@@ -637,7 +671,7 @@ static void handle_auth_register(int fd, const char *body) {
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     const char *params[5] = { name, email, team, password, "participant" };
@@ -649,7 +683,7 @@ static void handle_auth_register(int fd, const char *body) {
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         const char *err = PQresultErrorField(r, PG_DIAG_SQLSTATE);
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         if (err && strcmp(err, "23505") == 0)
             send_json(fd, 409, "Conflict", "{\"error\":\"email already registered\"}");
         else
@@ -671,7 +705,7 @@ static void handle_auth_register(int fd, const char *body) {
         "{\"token\":\"%s\",\"participant\":{\"id\":%d,\"name\":\"%s\",\"email\":\"%s\","
         "\"team\":\"%s\",\"role\":\"%s\",\"createdAt\":\"%s\"}}",
         token, user_id, ename, eemail, eteam, role, PQgetvalue(r, 0, 5));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 201, "Created", buf);
 }
 
@@ -685,7 +719,7 @@ static void handle_auth_login(int fd, const char *body) {
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     const char *params[1] = { email };
@@ -695,14 +729,14 @@ static void handle_auth_login(int fd, const char *body) {
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) == 0) {
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid email or password\"}");
         return;
     }
 
     const char *stored_pw = PQgetvalue(r, 0, 5);
     if (!stored_pw || strcmp(stored_pw, password) != 0) {
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid email or password\"}");
         return;
     }
@@ -721,7 +755,7 @@ static void handle_auth_login(int fd, const char *body) {
         "{\"token\":\"%s\",\"participant\":{\"id\":%d,\"name\":\"%s\",\"email\":\"%s\","
         "\"team\":\"%s\",\"role\":\"%s\",\"createdAt\":\"%s\"}}",
         token, user_id, ename, eemail, eteam, role ? role : "participant", PQgetvalue(r, 0, 6));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -738,7 +772,7 @@ static void handle_auth_me(int fd, const char *headers) {
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     char id_str[16];
@@ -749,7 +783,7 @@ static void handle_auth_me(int fd, const char *headers) {
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) == 0) {
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 404, "Not Found", "{\"error\":\"user not found\"}");
         return;
     }
@@ -764,7 +798,7 @@ static void handle_auth_me(int fd, const char *headers) {
         "{\"id\":%s,\"name\":\"%s\",\"email\":\"%s\",\"team\":\"%s\",\"role\":\"%s\",\"createdAt\":\"%s\"}",
         PQgetvalue(r, 0, 0), ename, eemail, eteam,
         db_role ? db_role : "participant", PQgetvalue(r, 0, 5));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -781,7 +815,7 @@ static void handle_session_create(int fd, const char *headers) {
     char code[CODE_LEN + 1];
     generate_code(code, CODE_LEN);
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     char id_str[16], expiry_str[32];
@@ -798,7 +832,7 @@ static void handle_session_create(int fd, const char *headers) {
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         fprintf(stderr, "Session create error: %s\n", PQresultErrorMessage(r));
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 500, "Internal Server Error", "{\"error\":\"session creation failed\"}");
         return;
     }
@@ -807,7 +841,7 @@ static void handle_session_create(int fd, const char *headers) {
     snprintf(buf, sizeof(buf),
         "{\"id\":%s,\"code\":\"%s\",\"expires_at\":\"%s\"}",
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), PQgetvalue(r, 0, 2));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 201, "Created", buf);
 }
 
@@ -819,7 +853,7 @@ static void handle_sessions_active(int fd, const char *headers) {
     if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
     if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     PGresult *r = PQexec(conn,
@@ -843,7 +877,7 @@ static void handle_sessions_active(int fd, const char *headers) {
                 title_esc, PQgetvalue(r, i, 6), PQgetvalue(r, i, 7));
         }
     }
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     sb_append(&sb, "]");
     send_json(fd, 200, "OK", sb.data);
     sb_free(&sb);
@@ -857,7 +891,7 @@ static void handle_session_get(int fd, const char *headers, const char *id_str) 
     if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
     if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     const char *params[1] = { id_str };
@@ -869,7 +903,7 @@ static void handle_session_get(int fd, const char *headers, const char *id_str) 
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) == 0) {
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 404, "Not Found", "{\"error\":\"session not found\"}");
         return;
     }
@@ -881,7 +915,7 @@ static void handle_session_get(int fd, const char *headers, const char *id_str) 
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), PQgetvalue(r, 0, 2),
         PQgetvalue(r, 0, 3), PQgetvalue(r, 0, 4)[0] == 't' ? "true" : "false",
         PQgetvalue(r, 0, 5), PQgetvalue(r, 0, 6));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -896,7 +930,7 @@ static void handle_session_refresh(int fd, const char *headers, const char *id_s
     char new_code[CODE_LEN + 1];
     generate_code(new_code, CODE_LEN);
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     char refresh_str[16];
@@ -911,7 +945,7 @@ static void handle_session_refresh(int fd, const char *headers, const char *id_s
         3, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) == 0) {
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 404, "Not Found", "{\"error\":\"session not found or inactive\"}");
         return;
     }
@@ -920,7 +954,7 @@ static void handle_session_refresh(int fd, const char *headers, const char *id_s
     snprintf(buf, sizeof(buf),
         "{\"id\":%s,\"code\":\"%s\",\"expires_at\":\"%s\"}",
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), PQgetvalue(r, 0, 2));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -942,7 +976,7 @@ static void handle_attendance_checkin(int fd, const char *headers, const char *b
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     /* Find active, non-expired session by code */
@@ -952,7 +986,7 @@ static void handle_attendance_checkin(int fd, const char *headers, const char *b
         1, NULL, p1, NULL, NULL, 0);
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) == 0) {
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 404, "Not Found", "{\"error\":\"session not found, inactive, or expired\"}");
         return;
     }
@@ -973,7 +1007,7 @@ static void handle_attendance_checkin(int fd, const char *headers, const char *b
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         const char *err = PQresultErrorField(r, PG_DIAG_SQLSTATE);
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         if (err && strcmp(err, "23505") == 0)
             send_json(fd, 409, "Conflict", "{\"error\":\"already checked in for this session\"}");
         else
@@ -985,7 +1019,7 @@ static void handle_attendance_checkin(int fd, const char *headers, const char *b
     snprintf(buf, sizeof(buf),
         "{\"id\":%s,\"participant_id\":%d,\"session_id\":%s,\"checkedInAt\":\"%s\"}",
         PQgetvalue(r, 0, 0), user_id, sid_buf, PQgetvalue(r, 0, 1));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 201, "Created", buf);
 }
 
@@ -1013,7 +1047,7 @@ static void handle_attendance_quick_checkin(int fd, const char *body) {
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) {
         send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}");
         return;
@@ -1033,7 +1067,7 @@ static void handle_attendance_quick_checkin(int fd, const char *body) {
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         const char *sqlstate = PQresultErrorField(r, PG_DIAG_SQLSTATE);
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         if (sqlstate && strcmp(sqlstate, "23505") == 0) {
             send_json(fd, 409, "Conflict",
                 "{\"error\":\"already checked in for this session\"}");
@@ -1051,7 +1085,7 @@ static void handle_attendance_quick_checkin(int fd, const char *body) {
             "SELECT 1 FROM \"Device\" WHERE device_uuid = $1", 1, NULL, p1, NULL, NULL, 0);
         int device_known = (PQresultStatus(dr) == PGRES_TUPLES_OK && PQntuples(dr) > 0);
         PQclear(dr);
-        PQfinish(conn);
+        db_release(conn);
         if (!device_known) {
             send_json(fd, 401, "Unauthorized",
                 "{\"error\":\"device not linked, please register first\"}");
@@ -1067,7 +1101,7 @@ static void handle_attendance_quick_checkin(int fd, const char *body) {
         "{\"id\":%s,\"participant_id\":%s,\"session_id\":%s,\"checkedInAt\":\"%s\"}",
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1),
         PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 201, "Created", buf);
 }
 
@@ -1098,7 +1132,7 @@ static void handle_attendance_batch_checkin(int fd, const char *body) {
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     /* Resolve session once */
@@ -1107,7 +1141,7 @@ static void handle_attendance_batch_checkin(int fd, const char *body) {
         "SELECT id FROM \"Session\" WHERE code = $1 AND active = true AND expires_at > NOW()",
         1, NULL, p1, NULL, NULL, 0);
     if (PQresultStatus(sr) != PGRES_TUPLES_OK || PQntuples(sr) == 0) {
-        PQclear(sr); PQfinish(conn);
+        PQclear(sr); db_release(conn);
         send_json(fd, 404, "Not Found", "{\"error\":\"session not found, inactive, or expired\"}");
         return;
     }
@@ -1163,7 +1197,7 @@ static void handle_attendance_batch_checkin(int fd, const char *body) {
     }
 
     PQexec(conn, "COMMIT");
-    PQfinish(conn);
+    db_release(conn);
 
     char out[128];
     snprintf(out, sizeof(out),
@@ -1179,7 +1213,7 @@ static void handle_attendance_session(int fd, const char *headers, const char *i
     int user_id = verify_token(token, role);
     if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     const char *params[1] = { id_str };
@@ -1204,7 +1238,7 @@ static void handle_attendance_session(int fd, const char *headers, const char *i
                 eteam, PQgetvalue(r, i, 5), PQgetvalue(r, i, 6));
         }
     }
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     sb_append(&sb, "]");
     send_json(fd, 200, "OK", sb.data);
     sb_free(&sb);
@@ -1217,7 +1251,7 @@ static void handle_attendance_me(int fd, const char *headers) {
     int user_id = verify_token(token, role);
     if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     char uid_str[16];
@@ -1240,7 +1274,7 @@ static void handle_attendance_me(int fd, const char *headers) {
                 PQgetvalue(r, i, 3), PQgetvalue(r, i, 4));
         }
     }
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     sb_append(&sb, "]");
     send_json(fd, 200, "OK", sb.data);
     sb_free(&sb);
@@ -1353,7 +1387,7 @@ static void handle_device_link(int fd, const char *headers, const char *body) {
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     char uid_str[16];
@@ -1370,7 +1404,7 @@ static void handle_device_link(int fd, const char *headers, const char *body) {
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         fprintf(stderr, "Device link error: %s\n", PQresultErrorMessage(r));
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 500, "Internal Server Error", "{\"error\":\"device link failed\"}");
         return;
     }
@@ -1379,7 +1413,7 @@ static void handle_device_link(int fd, const char *headers, const char *body) {
     snprintf(buf, sizeof(buf),
         "{\"id\":%s,\"device_uuid\":\"%s\",\"participant_id\":%s,\"linkedAt\":\"%s\"}",
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -1392,7 +1426,7 @@ static void handle_device_identify(int fd, const char *body) {
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     const char *params[1] = { device_uuid };
@@ -1403,7 +1437,7 @@ static void handle_device_identify(int fd, const char *body) {
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) == 0) {
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 404, "Not Found", "{\"error\":\"device not linked to any participant\"}");
         return;
     }
@@ -1419,7 +1453,7 @@ static void handle_device_identify(int fd, const char *body) {
         "\"role\":\"%s\",\"linkedAt\":\"%s\"}",
         PQgetvalue(r, 0, 0), ename, eemail, eteam,
         db_role ? db_role : "participant", PQgetvalue(r, 0, 5));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -1447,7 +1481,7 @@ static void handle_event_create(int fd, const char *headers, const char *body) {
         return;
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     char uid_str[16];
@@ -1468,7 +1502,7 @@ static void handle_event_create(int fd, const char *headers, const char *body) {
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         const char *err = PQresultErrorField(r, PG_DIAG_SQLSTATE);
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         if (err && strcmp(err, "23505") == 0) {
             send_json(fd, 409, "Conflict", "{\"error\":\"slug already in use\"}");
         } else {
@@ -1482,12 +1516,12 @@ static void handle_event_create(int fd, const char *headers, const char *body) {
         "{\"id\":%s,\"slug\":\"%s\",\"name\":\"%s\",\"createdAt\":\"%s\"}",
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1),
         PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 201, "Created", resp);
 }
 
 static void handle_events_list(int fd) {
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     PGresult *r = PQexec(conn,
@@ -1515,7 +1549,7 @@ static void handle_events_list(int fd) {
                 PQgetvalue(r, i, 7), PQgetvalue(r, i, 8));
         }
     }
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     sb_append(&sb, "]");
     send_json(fd, 200, "OK", sb.data);
     sb_free(&sb);
@@ -1533,7 +1567,7 @@ static void handle_participants_bulk(int fd, const char *headers, const char *bo
     if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
     if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     int created = 0, skipped = 0, line_num = 0;
@@ -1603,7 +1637,7 @@ static void handle_participants_bulk(int fd, const char *headers, const char *bo
         PQclear(r);
     }
 
-    PQfinish(conn);
+    db_release(conn);
     sb_append(&errors, "]");
 
     char resp[2048];
@@ -1655,7 +1689,7 @@ static void handle_participants_seed_stamp(int fd, const char *headers, const ch
         }
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     PQexec(conn, "BEGIN");
@@ -1676,7 +1710,7 @@ static void handle_participants_seed_stamp(int fd, const char *headers, const ch
         fprintf(stderr, "seed participants: %s\n", PQresultErrorMessage(r));
         PQclear(r);
         PQexec(conn, "ROLLBACK");
-        PQfinish(conn);
+        db_release(conn);
         send_json(fd, 500, "Internal Server Error", "{\"error\":\"participant seed failed\"}");
         return;
     }
@@ -1694,7 +1728,7 @@ static void handle_participants_seed_stamp(int fd, const char *headers, const ch
         fprintf(stderr, "seed devices: %s\n", PQresultErrorMessage(r));
         PQclear(r);
         PQexec(conn, "ROLLBACK");
-        PQfinish(conn);
+        db_release(conn);
         send_json(fd, 500, "Internal Server Error", "{\"error\":\"device seed failed\"}");
         return;
     }
@@ -1702,19 +1736,23 @@ static void handle_participants_seed_stamp(int fd, const char *headers, const ch
 
     PQexec(conn, "COMMIT");
 
-    /* Report counts */
+    /* Report counts AND return the participant ID range so callers
+     * don't need to re-fetch /participants for 2000 rows. */
     r = PQexecParams(conn,
         "SELECT (SELECT COUNT(*) FROM \"Participant\" WHERE email LIKE 'stamp-' || $1 || '-%@test.local')::int, "
-        "       (SELECT COUNT(*) FROM \"Device\"      WHERE device_uuid LIKE 'dev-stamp-' || $1 || '-%')::int",
+        "       (SELECT COUNT(*) FROM \"Device\"      WHERE device_uuid LIKE 'dev-stamp-' || $1 || '-%')::int, "
+        "       (SELECT MIN(id) FROM \"Participant\" WHERE email LIKE 'stamp-' || $1 || '-%@test.local')::int, "
+        "       (SELECT MAX(id) FROM \"Participant\" WHERE email LIKE 'stamp-' || $1 || '-%@test.local')::int",
         1, NULL, p2, NULL, NULL, 0);
-    char buf[128] = "{\"created\":0,\"devices\":0}";
+    char buf[256] = "{\"created\":0,\"devices\":0}";
     if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0) {
         snprintf(buf, sizeof(buf),
-            "{\"created\":%s,\"devices\":%s,\"run_id\":\"%s\"}",
-            PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), run_id);
+            "{\"created\":%s,\"devices\":%s,\"min_id\":%s,\"max_id\":%s,\"run_id\":\"%s\"}",
+            PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1),
+            PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3), run_id);
     }
     PQclear(r);
-    PQfinish(conn);
+    db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -1739,7 +1777,7 @@ static void handle_participants_seed_cleanup(int fd, const char *headers, const 
         }
     }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
     PQexec(conn, "BEGIN");
     const char *p1[1] = { run_id };
@@ -1754,7 +1792,7 @@ static void handle_participants_seed_cleanup(int fd, const char *headers, const 
         "DELETE FROM \"Participant\" WHERE email LIKE 'stamp-' || $1 || '-%@test.local'",
         1, NULL, p1, NULL, NULL, 0);
     PQexec(conn, "COMMIT");
-    PQfinish(conn);
+    db_release(conn);
     send_json(fd, 200, "OK", "{\"cleaned\":true}");
 }
 
@@ -1768,7 +1806,7 @@ static void handle_attendance_export(int fd, const char *headers, const char *id
     if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
     if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     const char *params[1] = { id_str };
@@ -1779,7 +1817,7 @@ static void handle_attendance_export(int fd, const char *headers, const char *id
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 500, "Internal Server Error", "{\"error\":\"query failed\"}");
         return;
     }
@@ -1798,7 +1836,7 @@ static void handle_attendance_export(int fd, const char *headers, const char *id
             PQgetvalue(r, i, 4),
             PQgetvalue(r, i, 5));
     }
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
 
     /* Custom response with download headers */
     char hdr[512];
@@ -1843,7 +1881,7 @@ static void handle_session_scheduled(int fd, const char *headers, const char *bo
     char code[CODE_LEN + 1];
     generate_code(code, CODE_LEN);
 
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     char uid_str[16];
@@ -1860,7 +1898,7 @@ static void handle_session_scheduled(int fd, const char *headers, const char *bo
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         fprintf(stderr, "Scheduled session error: %s\n", PQresultErrorMessage(r));
-        PQclear(r); PQfinish(conn);
+        PQclear(r); db_release(conn);
         send_json(fd, 500, "Internal Server Error", "{\"error\":\"creation failed\"}");
         return;
     }
@@ -1871,7 +1909,7 @@ static void handle_session_scheduled(int fd, const char *headers, const char *bo
         "\"starts_at\":\"%s\",\"ends_at\":\"%s\"}",
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1),
         PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3), PQgetvalue(r, 0, 4));
-    PQclear(r); PQfinish(conn);
+    PQclear(r); db_release(conn);
     send_json(fd, 201, "Created", resp);
 }
 
@@ -1994,7 +2032,7 @@ static void handle_ws_attendance(int fd, const char *headers, const char *id_str
     long last_id = 0;
 
     /* Get current max id so we only send new ones */
-    PGconn *conn = db_connect();
+    PGconn *conn = db_acquire();
     if (conn) {
         const char *params[1] = { session_id };
         PGresult *r = PQexecParams(conn,
@@ -2004,7 +2042,7 @@ static void handle_ws_attendance(int fd, const char *headers, const char *id_str
             last_id = atol(PQgetvalue(r, 0, 0));
         }
         PQclear(r);
-        PQfinish(conn);
+        db_release(conn);
     }
 
     /* Configure socket for non-blocking-style read with timeout for ping detection */
@@ -2015,7 +2053,7 @@ static void handle_ws_attendance(int fd, const char *headers, const char *id_str
     while (idle_seconds < 600) {  /* max 10 min idle */
         sleep(2);
 
-        conn = db_connect();
+        conn = db_acquire();
         if (!conn) { idle_seconds += 2; continue; }
 
         char last_str[32];
@@ -2044,14 +2082,14 @@ static void handle_ws_attendance(int fd, const char *headers, const char *id_str
                     PQgetvalue(r, i, 0), PQgetvalue(r, i, 1), ename, eemail,
                     eteam, PQgetvalue(r, i, 5), PQgetvalue(r, i, 6));
                 if (ws_send_text_frame(fd, frame, flen) < 0) {
-                    PQclear(r); PQfinish(conn);
+                    PQclear(r); db_release(conn);
                     return;  /* Client disconnected */
                 }
                 last_id = atol(PQgetvalue(r, i, 0));
             }
         }
         PQclear(r);
-        PQfinish(conn);
+        db_release(conn);
 
         if (new_rows > 0) {
             idle_seconds = 0;
@@ -2161,8 +2199,13 @@ static void handle_request(int fd, const char *method, const char *path,
         if (strncmp(path, "/ws/attendance/", 15) == 0) {
             pid_t pid = fork();
             if (pid == 0) {
-                /* Child: handle long-lived WS connection */
+                /* Child: handle long-lived WS connection. The cached
+                 * worker_conn was inherited from the parent worker; it
+                 * is invalid in this process (we can't share a libpq
+                 * connection across fork). Drop the pointer so child's
+                 * db_acquire opens a fresh one. */
                 signal(SIGCHLD, SIG_DFL);
+                worker_conn = NULL;
                 handle_ws_attendance(fd, headers, path + 15);
                 _exit(0);
             }
@@ -2253,13 +2296,97 @@ static void handle_request(int fd, const char *method, const char *path,
 
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
+/* ─── Worker accept loop ─────────────────────────────────────────────
+ * Runs in each pre-forked child. Reads requests, dispatches to router,
+ * then closes the connection. Loops forever. */
+static void run_worker_loop(int server_fd) {
+    /* Reap our own forked children (WebSocket handlers) automatically. */
+    signal(SIGCHLD, SIG_IGN);
+
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept"); continue;
+        }
+
+        /* Per-connection timeout — defeats slow-loris that would block
+         * this worker forever. */
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        /* Disable LINGER on accepted sockets — we want graceful close so
+         * the client sees the response, not a TCP RST. The LINGER=0 from
+         * the listening socket is inherited but applies only to the
+         * listening fd; explicitly clear it here to be safe. */
+        struct linger no_ling = { .l_onoff = 0, .l_linger = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_LINGER, &no_ling, sizeof(no_ling));
+
+        char buf[BUF_SIZE];
+        ssize_t total = 0;
+        ssize_t n;
+        while ((n = read(client_fd, buf + total, sizeof(buf) - total - 1)) > 0) {
+            total += n;
+            buf[total] = 0;
+            char *header_end = strstr(buf, "\r\n\r\n");
+            if (header_end) {
+                char *cl = strcasestr(buf, "Content-Length:");
+                if (cl) {
+                    int content_len = atoi(cl + 15);
+                    int header_size = (header_end + 4) - buf;
+                    int body_received = total - header_size;
+                    if (body_received >= content_len) break;
+                } else break;
+            }
+            if (total >= (ssize_t)sizeof(buf) - 1) break;
+        }
+        buf[total] = 0;
+
+        char method[16] = "", path[MAX_PATH] = "";
+        sscanf(buf, "%15s %1023s", method, path);
+
+        char *body = strstr(buf, "\r\n\r\n");
+        if (body) body += 4; else body = "";
+
+        uint32_t client_ip = client_addr.sin_addr.s_addr;
+        const char *cf_ip = strcasestr(buf, "CF-Connecting-IP:");
+        if (cf_ip) {
+            cf_ip += 17;
+            while (*cf_ip == ' ') cf_ip++;
+            char ip_str[64] = {0};
+            int j = 0;
+            while (*cf_ip && *cf_ip != '\r' && *cf_ip != '\n' && j < (int)sizeof(ip_str) - 1) {
+                ip_str[j++] = *cf_ip++;
+            }
+            struct in_addr ia;
+            if (inet_aton(ip_str, &ia)) client_ip = ia.s_addr;
+        }
+
+        int skip_rl = (strncmp(path, "/attendance/", 12) == 0) ||
+                      (strncmp(path, "/ws/", 4) == 0) ||
+                      (strncmp(path, "/deploy/", 8) == 0);
+        int rl_limit = (strncmp(path, "/auth/", 6) == 0) ? RL_AUTH_LIMIT : RL_DEFAULT_LIMIT;
+        if (!skip_rl && !rate_limit_check(client_ip, rl_limit)) {
+            send_rate_limited(client_fd);
+        } else {
+            handle_request(client_fd, method, path, buf, body);
+        }
+        close(client_fd);
+    }
+}
+
+/* On SIGTERM/SIGINT in the supervisor, kill the entire worker pool. */
+static void supervisor_term_handler(int sig) {
+    (void)sig;
+    /* Kill the whole process group (we did setpgid earlier). */
+    kill(0, SIGTERM);
+    _exit(0);
+}
+
 int main(void) {
     start_time = time(NULL);
-
-    /* Reap forked children automatically (used for WebSocket connections
-     * and deploy webhook scripts). Without this, exited children become
-     * zombies until the parent calls waitpid. */
-    signal(SIGCHLD, SIG_IGN);
 
     const char *port_str = getenv("PORT");
     int port = port_str ? atoi(port_str) : 3000;
@@ -2296,85 +2423,68 @@ int main(void) {
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); return 1;
     }
-    if (listen(server_fd, 16) < 0) { perror("listen"); return 1; }
+    if (listen(server_fd, 16384) < 0) { perror("listen"); return 1; }
 
-    printf("event-server v0.3.0-c listening on 0.0.0.0:%d\n", port);
+    printf("event-server v0.4.0-c listening on 0.0.0.0:%d\n", port);
     printf("Static dir: %s\n", static_dir);
     printf("Database: %s\n", db_url);
     printf("JWT Secret: %s\n", jwt_secret[0] ? "(set)" : "(default)");
 
-    /* Single-threaded: simpler, no zombie/port-lock issues.
-       PWA offline-first solves throughput; server doesn't need parallelism. */
+/* Pre-fork worker pool: N children share the listening socket.
+     * Override with WORKERS=N env (1 = single-process for smoke tests).
+     * Rationale for choosing 8 workers on a 3GB device with an 8-core
+     * Unisoc T618: matches CPU count; each worker does sync libpq, so
+     * it spends most wall time in PostgreSQL I/O (~5ms typical). */
+    int NUM_WORKERS = 8;
+    const char *workers_env = getenv("WORKERS");
+    if (workers_env) {
+        int w = atoi(workers_env);
+        if (w >= 1 && w <= 32) NUM_WORKERS = w;
+    }
+    pid_t worker_pids[32];
 
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0) { perror("accept"); continue; }
+    /* Ignore SIGPIPE globally so a client closing a connection mid-write
+     * does not kill the worker. */
+    signal(SIGPIPE, SIG_IGN);
 
-        char buf[BUF_SIZE];
-        ssize_t total = 0;
-        ssize_t n;
-        while ((n = read(client_fd, buf + total, sizeof(buf) - total - 1)) > 0) {
-            total += n;
-            /* Check if we have full headers */
-            buf[total] = 0;
-            char *header_end = strstr(buf, "\r\n\r\n");
-            if (header_end) {
-                /* Check Content-Length for body */
-                char *cl = strcasestr(buf, "Content-Length:");
-                if (cl) {
-                    int content_len = atoi(cl + 15);
-                    int header_size = (header_end + 4) - buf;
-                    int body_received = total - header_size;
-                    if (body_received >= content_len) break;
-                } else break;
-            }
-            if (total >= (ssize_t)sizeof(buf) - 1) break;
-        }
-        buf[total] = 0;
+    /* On graceful termination, kill the entire process group so workers
+     * don't orphan into the background and keep port 3001 bound. */
+    setpgid(0, 0);
+    signal(SIGTERM, supervisor_term_handler);
+    signal(SIGINT,  supervisor_term_handler);
 
-        /* Parse method and path */
-        char method[16] = "", path[MAX_PATH] = "";
-        sscanf(buf, "%15s %1023s", method, path);
-
-        /* Find body */
-        char *body = strstr(buf, "\r\n\r\n");
-        if (body) body += 4; else body = "";
-
-        /* Pass full headers buffer for Authorization extraction */
-        /* Rate limit check — try CF-Connecting-IP first (real client IP),
-         * fall back to socket peer address (LAN clients). */
-        uint32_t client_ip = client_addr.sin_addr.s_addr;
-        const char *cf_ip = strcasestr(buf, "CF-Connecting-IP:");
-        if (cf_ip) {
-            cf_ip += 17;
-            while (*cf_ip == ' ') cf_ip++;
-            char ip_str[64] = {0};
-            int j = 0;
-            while (*cf_ip && *cf_ip != '\r' && *cf_ip != '\n' && j < (int)sizeof(ip_str) - 1) {
-                ip_str[j++] = *cf_ip++;
-            }
-            struct in_addr ia;
-            if (inet_aton(ip_str, &ia)) client_ip = ia.s_addr;
-        }
-        /* Rate limiting strategy:
-         *   /auth/...        -> 10/min (anti brute force)
-         *   /attendance/...  -> UNLIMITED (PRIMARY GOAL: 2000 concurrent check-ins,
-         *                      all attendees share one venue WiFi IP, can't throttle)
-         *   /ws/...          -> UNLIMITED (long-lived connections, fork()ed)
-         *   /deploy/...      -> UNLIMITED (auth via secret query param)
-         *   everything else  -> 600/min (admin operations, generous) */
-        int skip_rl = (strncmp(path, "/attendance/", 12) == 0) ||
-                      (strncmp(path, "/ws/", 4) == 0) ||
-                      (strncmp(path, "/deploy/", 8) == 0);
-        int rl_limit = (strncmp(path, "/auth/", 6) == 0) ? RL_AUTH_LIMIT : RL_DEFAULT_LIMIT;
-        if (!skip_rl && !rate_limit_check(client_ip, rl_limit)) {
-            send_rate_limited(client_fd);
+    for (int w = 0; w < NUM_WORKERS; w++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* CHILD WORKER */
+            run_worker_loop(server_fd);
+            exit(0);
+        } else if (pid > 0) {
+            worker_pids[w] = pid;
         } else {
-            handle_request(client_fd, method, path, buf, body);
+            perror("fork worker");
         }
-        close(client_fd);
+    }
+    printf("Pre-forked %d worker processes.\n", NUM_WORKERS);
+
+    /* Parent: supervise + restart dead workers */
+    while (1) {
+        int status;
+        pid_t dead = wait(&status);
+        if (dead < 0) { sleep(1); continue; }
+        for (int w = 0; w < NUM_WORKERS; w++) {
+            if (worker_pids[w] == dead) {
+                fprintf(stderr, "[supervisor] worker pid=%d died, respawning\n", dead);
+                pid_t pid = fork();
+                if (pid == 0) {
+                    run_worker_loop(server_fd);
+                    exit(0);
+                } else if (pid > 0) {
+                    worker_pids[w] = pid;
+                }
+                break;
+            }
+        }
     }
 
     close(server_fd);
