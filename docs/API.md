@@ -253,7 +253,7 @@ tokens receive a `403 Forbidden` response.
 
 ### `POST /sessions/create`
 
-Create a new attendance session. The session is active immediately and
+Create a new ad-hoc attendance session. The session is active immediately and
 expires 30 minutes later (configurable at compile time).
 
 **Response 201**
@@ -264,6 +264,36 @@ expires 30 minutes later (configurable at compile time).
   "expires_at": "2026-05-22 08:30:00"
 }
 ```
+
+### `POST /sessions/scheduled`
+
+Create a named, scheduled attendance session with explicit time window.
+Useful for pre-published event programmes.
+
+**Request Body**
+```json
+{
+  "title":       "Day 1 Morning Plenary",
+  "description": "Opening keynote",
+  "starts_at":   "2026-05-22 09:00:00",
+  "ends_at":     "2026-05-22 12:00:00"
+}
+```
+
+**Response 201**
+```json
+{
+  "id":         15,
+  "code":       "rtxRqDN8",
+  "title":      "Day 1 Morning Plenary",
+  "starts_at":  "2026-05-22 09:00:00",
+  "ends_at":    "2026-05-22 12:00:00"
+}
+```
+
+**Errors**
+- `400` — Missing required fields
+- `403` — Not an administrator
 
 ### `GET /sessions/active`
 
@@ -382,6 +412,66 @@ The authenticated user's check-in history.
   }
 ]
 ```
+
+### `GET /attendance/session/:id/export`
+
+Download attendance data for a session as a CSV file. **Administrator
+access required.**
+
+**Headers**
+```
+Authorization: Bearer <admin-token>
+```
+
+**Response 200**
+- `Content-Type: text/csv; charset=utf-8`
+- `Content-Disposition: attachment; filename="attendance-session-<id>.csv"`
+
+**CSV Format**
+```csv
+id,name,email,team,device_id,checked_in_at
+89,"Jane Doe","jane@example.com","Engineering","dev-abc","2026-05-22 08:05:23"
+```
+
+---
+
+## Bulk Operations (Administrator Only)
+
+### `POST /participants/bulk`
+
+Bulk-create participants from a CSV body. Each line represents a
+participant. Errors are accumulated and returned but do not abort the
+batch.
+
+**Request**
+```http
+POST /participants/bulk
+Authorization: Bearer <admin-token>
+Content-Type: text/csv
+
+name,email,team[,password]
+Alice,alice@example.com,TeamA
+Bob,bob@example.com,TeamA,strong-password
+```
+
+The `password` column is optional. When omitted, a default placeholder
+password is set; participants must reset it on first login.
+
+**Response 200**
+```json
+{
+  "created": 2,
+  "skipped": 1,
+  "errors":  [
+    { "line": 4, "email": "alice@example.com", "error": "duplicate email" }
+  ]
+}
+```
+
+**Limits**
+- Each line must be ≤ 511 bytes
+- Total request body must fit in the server read buffer (currently 64 KB)
+- For larger imports, split into multiple requests
 
 ---
 

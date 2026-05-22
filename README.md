@@ -248,7 +248,8 @@ All endpoints accept and return JSON, with permissive CORS headers
 
 | Method | Endpoint                | Description                              |
 | ------ | ----------------------- | ---------------------------------------- |
-| POST   | `/sessions/create`      | Generate new attendance session.         |
+| POST   | `/sessions/create`      | Generate ad-hoc attendance session.      |
+| POST   | `/sessions/scheduled`   | Create named session with title and time window. |
 | GET    | `/sessions/active`      | List sessions that have not expired.     |
 | GET    | `/sessions/:id`         | Session detail with attendance count.    |
 | POST   | `/sessions/:id/refresh` | Rotate session code; extend expiry.      |
@@ -259,6 +260,7 @@ All endpoints accept and return JSON, with permissive CORS headers
 | ------ | ------------------------------ | ------ | -------------------------------------- |
 | POST   | `/attendance/checkin`          | Bearer | Record check-in for current user.      |
 | GET    | `/attendance/session/:id`      | Bearer | List check-ins for a session.          |
+| GET    | `/attendance/session/:id/export` | Admin | Download attendance as CSV.            |
 | GET    | `/attendance/me`               | Bearer | Authenticated user's attendance log.   |
 
 ### Device Identity
@@ -278,6 +280,7 @@ All endpoints accept and return JSON, with permissive CORS headers
 | GET    | `/stats/database`     | Database size and per-table statistics. |
 | GET    | `/stats/participants` | Aggregate participant counts.           |
 | GET    | `/participants`       | List all participants (paginate later). |
+| POST   | `/participants/bulk`  | (Admin) Bulk import via CSV body.       |
 
 ### Deployment Webhooks
 
