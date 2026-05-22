@@ -167,3 +167,15 @@ node loadtest/run-stampede.js 2000 http://<tablet-lan-ip>:3001
 
 The expected stampede outcome is documented in
 [`loadtest/README.md`](../loadtest/README.md).
+
+## State Files
+
+After the first successful boot, the server creates the following
+files in `$HOME` to persist runtime state across deployments and
+reboots:
+
+| File                       | Contents                                            |
+| -------------------------- | --------------------------------------------------- |
+| `~/.event-server-start`    | Unix epoch of the first ever boot of this service. Read on every startup; reported as `service_uptime` in `/health` and `/system`. Delete only when intentionally resetting the availability metric. |
+| `~/c-server.log`           | Append-only log of compile, smoke-test, and hot-swap output produced by `deploy-api.sh`. Rotated by `setup-cron.sh`. |
+| `~/backups/<YYYY-MM-DD>.sql.gz` | Daily logical dump produced by `db-backup.sh`. |

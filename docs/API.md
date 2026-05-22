@@ -53,8 +53,18 @@ Liveness probe. Returns immediately without database access.
 
 **Response 200**
 ```json
-{ "status": "ok", "uptime": 12345 }
+{
+  "status": "ok",
+  "uptime": 12345,
+  "service_uptime": 5184000
+}
 ```
+
+- `uptime` — seconds since the current process started (resets on every
+  hot-swap deployment).
+- `service_uptime` — seconds since the service was first booted on this
+  host. Persisted to `~/.event-server-start` and survives deployments,
+  pm2 restarts, and tablet reboots.
 
 ### `GET /health/detailed`
 
@@ -69,7 +79,8 @@ Health probe with database connectivity verification.
     "database": { "status": "ok", "latency_ms": 12 }
   },
   "uptime_seconds": 12345,
-  "version": "0.3.0-c",
+  "service_uptime_seconds": 5184000,
+  "version": "0.4.0-c",
   "node_version": "native-c"
 }
 ```
@@ -129,11 +140,23 @@ polled by the operational dashboard at `console.<domain>/`.
   },
   "uptime": {
     "system_seconds": 1247700,
-    "process_seconds": 9
+    "process_seconds": 9,
+    "service_seconds": 5184000
   },
   "timestamp": "2026-05-22T13:22:35Z"
 }
 ```
+
+The three uptime values represent distinct concerns:
+
+- `system_seconds` — Android kernel uptime since boot (relabel: "Tablet
+  uptime" in the dashboard). Resets only on a tablet reboot.
+- `process_seconds` — current `event-server` worker supervisor uptime.
+  Resets on every deploy or pm2 restart.
+- `service_seconds` — service uptime since first ever boot on this
+  host. Persisted via `~/.event-server-start`. Survives deploys,
+  watchdog restarts, and tablet reboots. This is the metric used to
+  reason about availability.
 
 **Notes on Android-specific limitations**
 
@@ -190,7 +213,16 @@ registrations.
 
 ### `GET /participants`
 
-List of all registered participants, ordered by `createdAt` descending.
+List of registered participants, ordered by `createdAt` descending.
+
+**Query parameters**
+
+| Name    | Default | Range  | Effect                                |
+| ------- | ------- | ------ | ------------------------------------- |
+| `limit` | 500     | 1–5000 | Maximum number of rows to return      |
+
+The dashboard uses `?limit=200` to keep the payload small and the page
+responsive even with a large participant set.
 
 **Response 200**
 ```json
@@ -629,6 +661,61 @@ password is set; participants must reset it on first login.
 - Each line must be ≤ 511 bytes
 - Total request body must fit in the server read buffer (currently 64 KB)
 - For larger imports, split into multiple requests
+
+### `POST /participants/seed-stamp`
+
+Synthetic-data seed used exclusively by the load-test harness in
+[`loadtest/run-stampede.js`](../loadtest/run-stampede.js). Creates N
+participants and N pre-linked devices in a single SQL transaction.
+Email addresses are generated as `stamp-<run_id>-<i>@test.local` and
+device UUIDs as `dev-stamp-<run_id>-<participant_id>` so that the
+harness can resolve them deterministically without a follow-up read.
+
+**Request Body**
+```json
+{ "n": "2000", "run_id": "rmphkflup" }
+```
+
+The `n` value must be a string (the JSON parser is intentionally
+permissive but expects quoted scalars). The `run_id` must contain only
+alphanumeric, underscore, or hyphen characters.
+
+**Response 200**
+```json
+{
+  "created":  2000,
+  "devices":  2000,
+  "min_id":   18175,
+  "max_id":   20174,
+  "run_id":   "rmphkflup"
+}
+```
+
+The `min_id`/`max_id` range allows the caller to compute device UUIDs
+without a separate `/participants` call.
+
+**Errors**
+- `400` — `n` out of range (1–5000) or `run_id` contains forbidden characters
+- `403` — Not an administrator
+
+### `POST /participants/seed-cleanup`
+
+Delete all rows tagged with the supplied `run_id`. Cascading: removes
+attendance rows, then devices, then participants in a single transaction.
+
+**Request Body**
+```json
+{ "run_id": "rmphkflup" }
+```
+
+**Response 200**
+```json
+{ "cleaned": true }
+```
+
+**Errors**
+- `400` — Missing or malformed `run_id`
+- `403` — Not an administrator
 
 ---
 

@@ -7,6 +7,7 @@ co-hosted on one Android tablet. Designed and verified to absorb a
 
 | Property                | Value                                       |
 | ----------------------- | ------------------------------------------- |
+| Version                 | 0.4.0-c                                     |
 | Reference host          | Galaxy Tab A8, Unisoc T618, 3 GB RAM        |
 | Runtime                 | Termux (no container, no proot)             |
 | Concurrency model       | Pre-fork worker pool, 8 workers             |
@@ -16,6 +17,7 @@ co-hosted on one Android tablet. Designed and verified to absorb a
 | Sustained throughput    | ~1,000 req/s LAN                            |
 | Median check-in latency | ~380 ms                                     |
 | Binary size             | ~80 KB                                      |
+| Service uptime          | Persistent across deploys and reboots       |
 
 Public endpoints:
 

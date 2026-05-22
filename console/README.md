@@ -18,13 +18,16 @@ An AWS-style operational dashboard that polls the API every 8 seconds
 to display:
 
 - API health and database latency
-- System metrics (CPU, memory, load average, uptime)
+- System metrics (CPU, memory, swap, storage, load average)
+- Service uptime (persistent across deploys; tablet uptime side-by-side)
 - Database statistics (size, table row counts)
 - Participant statistics (total, by team, recent registrations)
 - Full participant list with delete capability
 
 Implemented in vanilla HTML, CSS, and JavaScript. No framework, no
-build tooling. Total payload below 25 KB.
+build tooling. Typography uses IBM Plex Sans + IBM Plex Mono served
+from Google Fonts; tabular numerals keep monospace columns aligned.
+Total payload below 60 KB excluding fonts.
 
 ### Attendance Admin Page (`attend/admin.html`)
 

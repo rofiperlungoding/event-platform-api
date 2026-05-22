@@ -174,6 +174,32 @@ A daily logical dump runs at 03:00 local time via cron; see
 [`deploy/README.md`](../deploy/README.md). Off-site replication to
 Supabase is documented in [`REPLICATION.md`](REPLICATION.md).
 
+## Observability
+
+The dashboard at `console.<domain>/` and the `/system` endpoint expose
+three distinct uptime values:
+
+| Metric        | Source                          | Resets on…                              |
+| ------------- | ------------------------------- | --------------------------------------- |
+| Tablet uptime | `uptime` shell command          | Tablet hardware reboot                  |
+| Service uptime| `~/.event-server-start` file    | Manual deletion of the state file       |
+| Process uptime| `start_time` set in `main()`    | Every hot-swap or pm2 restart           |
+
+Service uptime is the headline availability metric. It is written to
+disk on the very first launch of `event-server` and read back on every
+subsequent start, so deployments, watchdog restarts, and tablet reboots
+all preserve it. A clean wipe requires explicitly removing
+`~/.event-server-start`.
+
+Health probes:
+
+- `GET /health` — sub-millisecond liveness probe; reports both
+  `uptime` (process) and `service_uptime` (persistent).
+- `GET /health/detailed` — exercises the database; reports
+  `uptime_seconds`, `service_uptime_seconds`, and per-check latency.
+- `GET /system` — full host telemetry: device, CPU, memory, swap,
+  storage, network, all three uptimes.
+
 ## Failure Modes and Mitigations
 
 | Failure                   | Detection                  | Mitigation                                      |

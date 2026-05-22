@@ -10,6 +10,7 @@ Reference workload for the platform's primary capacity goal:
 | `run-stampede.js`     | One-shot orchestrator: seeds participants and devices, creates a session, fires the parallel burst, prints percentiles, cleans up. |
 | `latency-probe.sh`    | Single-request and 100-concurrent baseline latency probe (run on the tablet).    |
 | `ws-test.js`          | WebSocket live-feed connectivity check.                                          |
+| `wipe-all.sql`        | Reset the entire database to a single admin row; resets all serial sequences.    |
 | `package.json`        | One dependency (`undici` for the high-concurrency dispatcher) and `ws`.          |
 
 ## Quick Start
@@ -24,6 +25,24 @@ node run-stampede.js 2000 http://<tablet-lan-ip>:3001
 
 Default admin credentials are picked up from `ADMIN_EMAIL` and
 `ADMIN_PASSWORD` (defaults match the reference deployment).
+
+## Inspecting the Run in the Dashboard
+
+By default the harness cleans up its synthetic data after the run.
+Set `NO_CLEANUP=1` to keep the seeded participants, devices, and
+attendance records visible in the operational dashboard:
+
+```bash
+NO_CLEANUP=1 node run-stampede.js 2000 http://<tablet-lan-ip>:3001
+```
+
+The `run_id` printed at the end can be passed back to
+`POST /participants/seed-cleanup` later, or the entire database can be
+wiped (admin row preserved) via:
+
+```bash
+psql -h 127.0.0.1 -U rofi -d eventplatform -f wipe-all.sql
+```
 
 ## Reference Result
 
@@ -99,8 +118,8 @@ connectivity returns. This converts a burst into a sustained
 
 ## Manual Cleanup
 
-`run-stampede.js` cleans up after a successful run. For interrupted
-runs, drop synthetic data manually:
+`run-stampede.js` cleans up after a successful run unless `NO_CLEANUP=1`
+was set. For interrupted runs, drop synthetic data manually:
 
 ```sql
 DELETE FROM "Attendance" WHERE participant_id IN (
@@ -109,3 +128,6 @@ DELETE FROM "Attendance" WHERE participant_id IN (
 DELETE FROM "Device"      WHERE device_uuid LIKE 'dev-stamp-%';
 DELETE FROM "Participant" WHERE email LIKE 'stamp-%@test.local';
 ```
+
+To wipe the entire database back to admin-only state (resets all
+sequences too), run [`wipe-all.sql`](wipe-all.sql).
