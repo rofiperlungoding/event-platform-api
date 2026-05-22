@@ -1828,9 +1828,18 @@ static void handle_request(int fd, const char *method, const char *path,
             return;
         }
         if (strcmp(path, "/attendance/me") == 0) { handle_attendance_me(fd, headers); return; }
-        /* WebSocket live feed */
+        /* WebSocket live feed — runs in forked child to avoid blocking
+         * the single-threaded accept loop. */
         if (strncmp(path, "/ws/attendance/", 15) == 0) {
-            handle_ws_attendance(fd, headers, path + 15);
+            pid_t pid = fork();
+            if (pid == 0) {
+                /* Child: handle long-lived WS connection */
+                signal(SIGCHLD, SIG_DFL);
+                handle_ws_attendance(fd, headers, path + 15);
+                _exit(0);
+            }
+            /* Parent: SIGCHLD reaper handles zombie cleanup; just close fd
+             * (child has its own fd via fork's copy-on-write). */
             return;
         }
         /* Device */
@@ -1904,6 +1913,11 @@ static void handle_request(int fd, const char *method, const char *path,
 
 int main(void) {
     start_time = time(NULL);
+
+    /* Reap forked children automatically (used for WebSocket connections
+     * and deploy webhook scripts). Without this, exited children become
+     * zombies until the parent calls waitpid. */
+    signal(SIGCHLD, SIG_IGN);
 
     const char *port_str = getenv("PORT");
     int port = port_str ? atoi(port_str) : 3000;
