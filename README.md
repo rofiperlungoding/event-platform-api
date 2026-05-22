@@ -282,6 +282,13 @@ All endpoints accept and return JSON, with permissive CORS headers
 | GET    | `/participants`       | List all participants (paginate later). |
 | POST   | `/participants/bulk`  | (Admin) Bulk import via CSV body.       |
 
+### Events (Administrator Only)
+
+| Method | Endpoint   | Description                          |
+| ------ | ---------- | ------------------------------------ |
+| POST   | `/events`  | Create a new event.                  |
+| GET    | `/events`  | List all events with summary counts. |
+
 ### Deployment Webhooks
 
 | Method | Endpoint                    | Description                              |
@@ -458,12 +465,20 @@ following:
 | ------------------------------------ | --------------------------------------------- |
 | Plaintext password storage           | Replace with bcrypt or Argon2 hashing.        |
 | FNV-1a token signing                 | Replace with HMAC-SHA256 (use OpenSSL).       |
-| No rate limiting                     | Add per-IP rate limit on auth endpoints.      |
 | Webhook secret in query string       | Move to header-based HMAC verification.       |
 | CORS wildcard                        | Restrict to known frontend origins.           |
 | No HTTPS at origin                   | Acceptable since Cloudflare terminates TLS;   |
 |                                      | for direct LAN exposure, terminate locally.   |
 | Single-process database access       | Add connection pooling (PgBouncer) at scale.  |
+
+The server includes a basic in-memory rate limiter:
+- `/auth/*` endpoints: 10 requests / 60 seconds / IP
+- All other endpoints: 60 requests / 60 seconds / IP
+- Real client IP extracted from `CF-Connecting-IP` header when present.
+
+The rate limiter is a fixed-window counter with 256 hash slots;
+collisions cause shared limits across IPs. For more sophisticated rate
+limiting, use a Redis-backed sliding window or token bucket.
 
 ---
 

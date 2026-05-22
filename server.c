@@ -141,7 +141,7 @@ static int json_escape(char *dst, int max, const char *src) {
 #define RL_BUCKETS 256
 #define RL_WINDOW_SEC 60
 #define RL_DEFAULT_LIMIT 60        /* most endpoints */
-#define RL_AUTH_LIMIT 10           /* /auth/* (anti brute force) */
+#define RL_AUTH_LIMIT 10           /* auth endpoints (anti brute force) */
 
 typedef struct {
     uint32_t ip;
