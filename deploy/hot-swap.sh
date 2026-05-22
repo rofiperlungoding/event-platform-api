@@ -22,7 +22,7 @@ WEBHOOK_SECRET="intriviadeploy2026" \
 STATIC_DIR=/data/data/com.termux/files/home/projects/event-platform-console \
 ./event-server-staging >> "$LOG" 2>&1 &
 SMOKE_PID=$!
-sleep 1
+sleep 2
 if ! curl -sf "http://localhost:$SMOKE_PORT/health" > /dev/null; then
     echo "[$(date)] hot-swap: smoke test FAILED" >> "$LOG"
     kill "$SMOKE_PID" 2>/dev/null || true
