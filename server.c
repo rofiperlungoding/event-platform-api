@@ -52,7 +52,8 @@
 #define SESSION_REFRESH 30  /* 30 seconds extension */
 #define CODE_LEN 8
 
-static time_t start_time;
+static time_t start_time;          /* current process start (resets on hot-swap) */
+static time_t service_start_time;  /* persistent: first-ever boot of this service */
 static char static_dir[MAX_PATH];
 static char db_url[1024];
 static char jwt_secret[256];
@@ -409,8 +410,11 @@ static void generate_code(char *out, int len) {
 /* ─── Original Route Handlers (unchanged) ─────────────────────────────── */
 
 static void handle_health(int fd) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"uptime\":%ld}", (long)(time(NULL) - start_time));
+    char buf[160];
+    snprintf(buf, sizeof(buf),
+        "{\"status\":\"ok\",\"uptime\":%ld,\"service_uptime\":%ld}",
+        (long)(time(NULL) - start_time),
+        (long)(time(NULL) - service_start_time));
     send_json(fd, 200, "OK", buf);
 }
 
@@ -436,8 +440,11 @@ static void handle_health_detailed(int fd) {
     snprintf(buf, sizeof(buf),
         "{\"status\":\"%s\",\"checks\":{\"api\":{\"status\":\"ok\",\"latency_ms\":%ld},"
         "\"database\":{\"status\":\"%s\",\"latency_ms\":%ld}},"
-        "\"uptime_seconds\":%ld,\"version\":\"0.3.0-c\",\"node_version\":\"native-c\"}",
-        overall, api_ms, db_status, db_ms, (long)(time(NULL) - start_time));
+        "\"uptime_seconds\":%ld,\"service_uptime_seconds\":%ld,"
+        "\"version\":\"0.4.0-c\",\"node_version\":\"native-c\"}",
+        overall, api_ms, db_status, db_ms,
+        (long)(time(NULL) - start_time),
+        (long)(time(NULL) - service_start_time));
     send_json(fd, 200, "OK", buf);
 }
 
@@ -545,6 +552,7 @@ static void handle_system(int fd) {
 
     /* Timestamp */
     long uptime_proc = (long)(time(NULL) - start_time);
+    long uptime_service = (long)(time(NULL) - service_start_time);
     time_t now = time(NULL);
     struct tm *tm = gmtime(&now);
     char ts[64];
@@ -569,14 +577,14 @@ static void handle_system(int fd) {
         "\"used_percent\":%.1f},"
         "\"disk\":{\"total_bytes\":%ld,\"used_bytes\":%ld,\"free_bytes\":%ld,"
         "\"used_percent\":%d},"
-        "\"uptime\":{\"system_seconds\":%ld,\"process_seconds\":%ld},"
+        "\"uptime\":{\"system_seconds\":%ld,\"process_seconds\":%ld,\"service_seconds\":%ld},"
         "\"timestamp\":\"%s\"}",
         hostname, emodel, ebrand, android_ver, lan_ip,
         l1, l5, l15,
         total, used, free_mem, avail, buffers, cached, used_pct,
         swap_total, swap_used, swap_free, swap_pct,
         disk_total, disk_used, disk_free, disk_pct,
-        sys_uptime_sec, uptime_proc, ts);
+        sys_uptime_sec, uptime_proc, uptime_service, ts);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -2517,6 +2525,27 @@ static void supervisor_term_handler(int sig) {
 
 int main(void) {
     start_time = time(NULL);
+
+    /* Persistent service start time across deploys / hot-swaps / reboots.
+     * The boot script also writes this once at first system boot so that
+     * a tablet reboot does not reset service uptime. The file is plain
+     * ASCII Unix epoch on a single line. */
+    {
+        const char *path = "/data/data/com.termux/files/home/.event-server-start";
+        FILE *f = fopen(path, "r");
+        if (f) {
+            long t = 0;
+            if (fscanf(f, "%ld", &t) == 1 && t > 0) {
+                service_start_time = (time_t)t;
+            }
+            fclose(f);
+        }
+        if (service_start_time == 0) {
+            service_start_time = start_time;
+            f = fopen(path, "w");
+            if (f) { fprintf(f, "%ld\n", (long)service_start_time); fclose(f); }
+        }
+    }
 
     const char *port_str = getenv("PORT");
     int port = port_str ? atoi(port_str) : 3000;

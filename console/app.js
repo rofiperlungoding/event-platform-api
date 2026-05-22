@@ -107,8 +107,14 @@ function renderHealth(d) {
     `<span>${dbLat}</span><span class="unit">ms</span>`;
   applyStatus('kpi-card-latency', dbLat < 50 ? 'ok' : dbLat < 200 ? 'warn' : 'error');
 
-  // Uptime KPI
-  $('#kpi-uptime').textContent = fmtUptime(d.uptime_seconds);
+  // Uptime KPI — service uptime is what matters (persists across deploys)
+  const svcUp = d.service_uptime_seconds ?? d.uptime_seconds;
+  const procUp = d.uptime_seconds;
+  $('#kpi-uptime').textContent = fmtUptime(svcUp);
+  $('#kpi-uptime-sub').textContent = procUp < svcUp
+    ? `process: ${fmtUptime(procUp)} (last deploy)`
+    : `since first deploy`;
+  applyStatus('kpi-card-uptime', svcUp >= 86400 ? 'ok' : 'info');
 
   // Health checks badge — semantic
   const badge = $('#health-badge');
@@ -198,8 +204,9 @@ function renderSystem(d) {
   applyStatus('sys-card-disk', usageClass(diskPct) === 'high' ? 'error' : usageClass(diskPct) === 'warn' ? 'warn' : 'ok');
 
   const sysUp = d.uptime?.system_seconds || 0;
+  const svcUp = d.uptime?.service_seconds || 0;
   $('#sys-uptime').textContent = fmtUptime(sysUp);
-  $('#sys-uptime-detail').textContent = `process: ${fmtUptime(d.uptime?.process_seconds || 0)}`;
+  $('#sys-uptime-detail').textContent = `service: ${fmtUptime(svcUp)} · process: ${fmtUptime(d.uptime?.process_seconds || 0)}`;
 
   $('#host-table').innerHTML = `
     <tr><td>Device</td><td>${escapeHtml(((dev.brand || '') + ' ' + (dev.model || '')).trim() || '—')}</td></tr>
@@ -209,6 +216,7 @@ function renderSystem(d) {
     <tr><td>Hostname</td><td><code>${escapeHtml(d.hostname || '—')}</code></td></tr>
     <tr><td>LAN IP</td><td><code>${escapeHtml(net.lan_ip || '—')}:${net.port || 3001}</code></td></tr>
     <tr><td>System uptime</td><td>${fmtUptime(sysUp)}</td></tr>
+    <tr><td>Service uptime</td><td>${fmtUptime(svcUp)}</td></tr>
     <tr><td>Process uptime</td><td>${fmtUptime(d.uptime?.process_seconds || 0)}</td></tr>
     <tr><td>Last reading</td><td class="muted small">${fmtTime(d.timestamp)}</td></tr>
   `;
