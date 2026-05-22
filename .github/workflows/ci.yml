@@ -8,20 +8,29 @@ on:
 
 jobs:
   build:
+    name: Build & Validate
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpq-dev
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Compile server
+        run: cc -O2 -Wall -o event-server server.c -lpq
 
-      - name: Generate Prisma client
-        run: npx prisma generate
+      - name: Validate shell scripts
+        run: |
+          for f in deploy/*.sh; do
+            bash -n "$f" || exit 1
+          done
+          echo "All shell scripts have valid syntax."
 
-      - name: Type check & build
-        run: npm run build
+      - name: Verify binary
+        run: |
+          test -x event-server
+          ls -la event-server

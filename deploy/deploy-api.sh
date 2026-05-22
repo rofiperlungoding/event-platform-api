@@ -32,10 +32,10 @@ COMMIT=$(git rev-parse --short HEAD)
 echo "[$(date)] On commit: $COMMIT" >> "$LOG"
 
 # 2. Compile to staging
-cp server2.c "$BUILD_DIR/server2.c"
+cp server.c "$BUILD_DIR/server.c"
 cd "$BUILD_DIR"
 echo "[$(date)] Compiling..." >> "$LOG"
-if ! cc -O2 -o event-server-staging server2.c \
+if ! cc -O2 -o event-server-staging server.c \
     -I/data/data/com.termux/files/usr/include \
     -L/data/data/com.termux/files/usr/lib \
     -lpq >> "$LOG" 2>&1; then

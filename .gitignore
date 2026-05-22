@@ -1,17 +1,17 @@
-node_modules
-dist
-src/generated
-.env
-.env.*
-!.env.example
-!.env.prod.example
+# Build artifacts
+event-server
+event-server-*
+*.o
+*.bak
+
+# Logs
 *.log
+
+# OS
 .DS_Store
-.idea
+Thumbs.db
+
+# Editor
 .vscode/*
 !.vscode/extensions.json
-
-# Build artifacts (built on tab, not in repo)
-event-server*
-*.bak
-console/
+.idea/
