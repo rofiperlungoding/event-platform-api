@@ -190,7 +190,16 @@ console.log(`   Run id: ${RUN_ID}\n`);
   const goodPct = (ok.length + dup.length) / results.length * 100;
   console.log(`\n  ${goodPct >= 99.5 ? '✅ PASS' : goodPct >= 95 ? '⚠️ MARGINAL' : '❌ FAIL'}: ${goodPct.toFixed(2)}% accepted`);
 
-  /* 7. Cleanup seeded data */
+  /* 7. Cleanup seeded data (skip with NO_CLEANUP=1 to keep data visible
+   *    in the operational dashboard for inspection) */
+  if (process.env.NO_CLEANUP === '1') {
+    console.log('\n→ NO_CLEANUP=1 — keeping seeded data for inspection');
+    console.log(`   To clean up later:  curl -X POST ${API}/participants/seed-cleanup \\`);
+    console.log(`                          -H "Authorization: Bearer <admin>" \\`);
+    console.log(`                          -d '{"run_id":"${RUN_ID}"}'`);
+    console.log();
+    return;
+  }
   console.log('\n→ cleaning up seeded data ...');
   await fetch(`${API}/participants/seed-cleanup`, {
     method: 'POST',
