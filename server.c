@@ -686,17 +686,24 @@ static void handle_sessions_active(int fd, const char *headers) {
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
     PGresult *r = PQexec(conn,
-        "SELECT id, code, created_by, expires_at, \"createdAt\" FROM \"Session\" "
+        "SELECT id, code, created_by, expires_at, \"createdAt\", "
+        "COALESCE(title, ''), COALESCE(starts_at::text, ''), COALESCE(ends_at::text, '') "
+        "FROM \"Session\" "
         "WHERE active = true AND expires_at > NOW() ORDER BY \"createdAt\" DESC");
 
     strbuf sb; sb_init(&sb, 2048);
     sb_append(&sb, "[");
     if (PQresultStatus(r) == PGRES_TUPLES_OK) {
         for (int i = 0; i < PQntuples(r); i++) {
+            char title_esc[512];
+            json_escape(title_esc, sizeof(title_esc), PQgetvalue(r, i, 5));
             if (i > 0) sb_append(&sb, ",");
-            sb_appendf(&sb, "{\"id\":%s,\"code\":\"%s\",\"created_by\":%s,\"expires_at\":\"%s\",\"createdAt\":\"%s\"}",
+            sb_appendf(&sb, "{\"id\":%s,\"code\":\"%s\",\"created_by\":%s,"
+                "\"expires_at\":\"%s\",\"createdAt\":\"%s\","
+                "\"title\":\"%s\",\"starts_at\":\"%s\",\"ends_at\":\"%s\"}",
                 PQgetvalue(r, i, 0), PQgetvalue(r, i, 1), PQgetvalue(r, i, 2),
-                PQgetvalue(r, i, 3), PQgetvalue(r, i, 4));
+                PQgetvalue(r, i, 3), PQgetvalue(r, i, 4),
+                title_esc, PQgetvalue(r, i, 6), PQgetvalue(r, i, 7));
         }
     }
     PQclear(r); PQfinish(conn);
@@ -1095,6 +1102,216 @@ static void handle_device_identify(int fd, const char *body) {
     send_json(fd, 200, "OK", buf);
 }
 
+/* ─── Bulk Participant Import (Admin Only) ────────────────────────────── */
+/* Accepts CSV body with header line: name,email,team
+ * Returns JSON summary: {"created":N, "skipped":M, "errors":[...]}    */
+
+static void handle_participants_bulk(int fd, const char *headers, const char *body) {
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int user_id = verify_token(token, role);
+    if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
+
+    PGconn *conn = db_connect();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+
+    int created = 0, skipped = 0, line_num = 0;
+    strbuf errors; sb_init(&errors, 1024);
+    sb_append(&errors, "[");
+
+    /* Parse CSV line by line. Skip header. */
+    const char *p = body;
+    char line_buf[512];
+    while (*p) {
+        /* Read one line into line_buf */
+        int li = 0;
+        while (*p && *p != '\n' && *p != '\r' && li < (int)sizeof(line_buf) - 1) {
+            line_buf[li++] = *p++;
+        }
+        line_buf[li] = 0;
+        while (*p == '\n' || *p == '\r') p++;
+        line_num++;
+
+        /* Skip empty lines and header */
+        if (li == 0) continue;
+        if (line_num == 1 && (strstr(line_buf, "name") || strstr(line_buf, "email"))) continue;
+
+        /* Parse comma-separated fields: name,email,team,[password] */
+        char *fields[4] = {0};
+        int fi = 0;
+        char *cursor = line_buf;
+        fields[fi++] = cursor;
+        while (*cursor && fi < 4) {
+            if (*cursor == ',') {
+                *cursor++ = 0;
+                fields[fi++] = cursor;
+            } else cursor++;
+        }
+        if (fi < 3) {
+            if (errors.len > 1) sb_append(&errors, ",");
+            sb_appendf(&errors, "{\"line\":%d,\"error\":\"too few fields\"}", line_num);
+            skipped++;
+            continue;
+        }
+        const char *name  = fields[0];
+        const char *email = fields[1];
+        const char *team  = fields[2];
+        const char *password = fields[3] ? fields[3] : "default-pw-please-change";
+
+        const char *params[5] = { name, email, team, password, "participant" };
+        PGresult *r = PQexecParams(conn,
+            "INSERT INTO \"Participant\" (name, email, team, password_hash, role, "
+            "\"createdAt\", \"updatedAt\") VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
+            5, NULL, params, NULL, NULL, 0);
+
+        if (PQresultStatus(r) == PGRES_COMMAND_OK) {
+            created++;
+        } else {
+            const char *err_code = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+            if (err_code && strcmp(err_code, "23505") == 0) {
+                skipped++;
+                if (errors.len > 1) sb_append(&errors, ",");
+                sb_appendf(&errors, "{\"line\":%d,\"email\":\"%s\",\"error\":\"duplicate email\"}",
+                    line_num, email);
+            } else {
+                skipped++;
+                if (errors.len > 1) sb_append(&errors, ",");
+                sb_appendf(&errors, "{\"line\":%d,\"error\":\"insert failed\"}", line_num);
+            }
+        }
+        PQclear(r);
+    }
+
+    PQfinish(conn);
+    sb_append(&errors, "]");
+
+    char resp[2048];
+    snprintf(resp, sizeof(resp),
+        "{\"created\":%d,\"skipped\":%d,\"errors\":%s}",
+        created, skipped, errors.data);
+    sb_free(&errors);
+    send_json(fd, 200, "OK", resp);
+}
+
+/* ─── Attendance CSV Export (Admin Only) ──────────────────────────────── */
+
+static void handle_attendance_export(int fd, const char *headers, const char *id_str) {
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int user_id = verify_token(token, role);
+    if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
+
+    PGconn *conn = db_connect();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+
+    const char *params[1] = { id_str };
+    PGresult *r = PQexecParams(conn,
+        "SELECT a.id, p.name, p.email, p.team, a.device_id, a.\"checkedInAt\" "
+        "FROM \"Attendance\" a JOIN \"Participant\" p ON p.id = a.participant_id "
+        "WHERE a.session_id = $1 ORDER BY a.\"checkedInAt\" ASC",
+        1, NULL, params, NULL, NULL, 0);
+
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+        PQclear(r); PQfinish(conn);
+        send_json(fd, 500, "Internal Server Error", "{\"error\":\"query failed\"}");
+        return;
+    }
+
+    /* Build CSV body */
+    strbuf csv; sb_init(&csv, 4096);
+    sb_append(&csv, "id,name,email,team,device_id,checked_in_at\r\n");
+    int rows = PQntuples(r);
+    for (int i = 0; i < rows; i++) {
+        /* CSV escape: wrap in quotes if value contains comma/quote/newline */
+        sb_appendf(&csv, "%s,\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\r\n",
+            PQgetvalue(r, i, 0),
+            PQgetvalue(r, i, 1),
+            PQgetvalue(r, i, 2),
+            PQgetvalue(r, i, 3),
+            PQgetvalue(r, i, 4),
+            PQgetvalue(r, i, 5));
+    }
+    PQclear(r); PQfinish(conn);
+
+    /* Custom response with download headers */
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "%s"
+        "Content-Type: text/csv; charset=utf-8\r\n"
+        "Content-Disposition: attachment; filename=\"attendance-session-%s.csv\"\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n\r\n",
+        cors_headers, id_str, csv.len);
+    write(fd, hdr, hlen);
+    write(fd, csv.data, csv.len);
+    sb_free(&csv);
+}
+
+/* ─── Scheduled Session (Admin Only) ──────────────────────────────────── */
+/* Creates a "named" session with title + scheduled time window.
+ * Body: {"title":"...","description":"...","starts_at":"YYYY-MM-DD HH:MM:SS",
+ *        "ends_at":"...","duration_minutes":N}                           */
+
+static void handle_session_scheduled(int fd, const char *headers, const char *body) {
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int user_id = verify_token(token, role);
+    if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
+
+    char title[256] = "", description[1024] = "", starts_at[64] = "", ends_at[64] = "";
+    EXTRACT_JSON(body, "title", title, sizeof(title));
+    EXTRACT_JSON(body, "description", description, sizeof(description));
+    EXTRACT_JSON(body, "starts_at", starts_at, sizeof(starts_at));
+    EXTRACT_JSON(body, "ends_at", ends_at, sizeof(ends_at));
+
+    if (!title[0] || !starts_at[0] || !ends_at[0]) {
+        send_json(fd, 400, "Bad Request",
+            "{\"error\":\"title, starts_at, and ends_at are required\"}");
+        return;
+    }
+
+    char code[CODE_LEN + 1];
+    generate_code(code, CODE_LEN);
+
+    PGconn *conn = db_connect();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+
+    char uid_str[16];
+    snprintf(uid_str, sizeof(uid_str), "%d", user_id);
+
+    const char *params[6] = { code, uid_str, ends_at, title,
+                              description[0] ? description : NULL, starts_at };
+    PGresult *r = PQexecParams(conn,
+        "INSERT INTO \"Session\" (code, created_by, expires_at, active, "
+        "\"createdAt\", title, description, starts_at, ends_at) "
+        "VALUES ($1, $2, $3::timestamp, true, NOW(), $4, $5, $6::timestamp, $3::timestamp) "
+        "RETURNING id, code, title, starts_at, ends_at",
+        6, NULL, params, NULL, NULL, 0);
+
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "Scheduled session error: %s\n", PQresultErrorMessage(r));
+        PQclear(r); PQfinish(conn);
+        send_json(fd, 500, "Internal Server Error", "{\"error\":\"creation failed\"}");
+        return;
+    }
+
+    char resp[1024];
+    snprintf(resp, sizeof(resp),
+        "{\"id\":%s,\"code\":\"%s\",\"title\":\"%s\","
+        "\"starts_at\":\"%s\",\"ends_at\":\"%s\"}",
+        PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1),
+        PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3), PQgetvalue(r, 0, 4));
+    PQclear(r); PQfinish(conn);
+    send_json(fd, 201, "Created", resp);
+}
+
 /* ─── Static File Serving ─────────────────────────────────────────────── */
 
 static void serve_static(int fd, const char *path) {
@@ -1163,7 +1380,20 @@ static void handle_request(int fd, const char *method, const char *path,
         }
         /* Attendance */
         if (strncmp(path, "/attendance/session/", 20) == 0) {
-            handle_attendance_session(fd, headers, path + 20);
+            const char *sub = path + 20;
+            /* Check if /attendance/session/:id/export */
+            const char *slash = strchr(sub, '/');
+            if (slash && strcmp(slash, "/export") == 0) {
+                char id_buf[16];
+                int id_len = (int)(slash - sub);
+                if (id_len > 0 && id_len < (int)sizeof(id_buf)) {
+                    memcpy(id_buf, sub, id_len);
+                    id_buf[id_len] = 0;
+                    handle_attendance_export(fd, headers, id_buf);
+                    return;
+                }
+            }
+            handle_attendance_session(fd, headers, sub);
             return;
         }
         if (strcmp(path, "/attendance/me") == 0) { handle_attendance_me(fd, headers); return; }
@@ -1190,6 +1420,9 @@ static void handle_request(int fd, const char *method, const char *path,
         if (strcmp(path, "/auth/login") == 0) { handle_auth_login(fd, body); return; }
         /* Sessions */
         if (strcmp(path, "/sessions/create") == 0) { handle_session_create(fd, headers); return; }
+        if (strcmp(path, "/sessions/scheduled") == 0) { handle_session_scheduled(fd, headers, body); return; }
+        /* Bulk participant import */
+        if (strcmp(path, "/participants/bulk") == 0) { handle_participants_bulk(fd, headers, body); return; }
         if (strncmp(path, "/sessions/", 10) == 0) {
             /* Check for /sessions/:id/refresh */
             const char *rest = path + 10;
