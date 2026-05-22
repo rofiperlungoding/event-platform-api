@@ -4,6 +4,9 @@ event-server-*
 *.o
 *.bak
 
+# Dependencies
+node_modules/
+
 # Logs
 *.log
 
