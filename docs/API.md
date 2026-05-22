@@ -376,6 +376,84 @@ constraint).
 - `404` — Session code not found, inactive, or expired
 - `409` — Already checked in to this session
 
+### `POST /attendance/quick-checkin`
+
+High-throughput, device-keyed check-in path. Designed as the primary
+endpoint for large-scale simultaneous attendance ingestion (the project's
+reference target is 2000 concurrent attendees).
+
+Unlike `POST /attendance/checkin`, this endpoint does **not** require a
+bearer token. The participant identity is resolved from the
+`device_uuid`, which must have been previously linked via
+`POST /device/link`. The full operation — device lookup, session lookup,
+and attendance insertion — is executed as a single SQL statement (CTE)
+to minimise round trips and lock window.
+
+This endpoint is **excluded from rate limiting** to support large
+shared-NAT scenarios where every attendee egresses from the same venue
+WiFi public IP.
+
+**Request Body**
+```json
+{
+  "session_code": "aB3xY7zQ",
+  "device_uuid":  "dev-abc123-uuid"
+}
+```
+
+**Response 201**
+```json
+{
+  "id": 89,
+  "participant_id": 5,
+  "session_id": 12,
+  "checkedInAt": "2026-05-22 08:05:23.123"
+}
+```
+
+**Errors**
+- `400` — Missing `session_code` or `device_uuid`
+- `401` — Device UUID not linked to any participant
+- `404` — Session code not found, inactive, or expired
+- `409` — Already checked in to this session
+
+### `POST /attendance/batch-checkin`
+
+Bulk drain endpoint used by the scanner Progressive Web Application
+when reconciling its offline queue. Accepts up to several hundred
+device UUIDs in a single request; the server commits all rows in a
+single database transaction.
+
+**Request Body**
+```json
+{
+  "session_code": "aB3xY7zQ",
+  "items": [
+    { "device_uuid": "dev-aaa-uuid" },
+    { "device_uuid": "dev-bbb-uuid" },
+    { "device_uuid": "dev-ccc-uuid" }
+  ]
+}
+```
+
+**Response 200**
+```json
+{
+  "accepted":   2,
+  "duplicates": 1,
+  "unknown":    0
+}
+```
+
+The three counters partition the input set:
+- `accepted` — newly inserted attendance rows.
+- `duplicates` — devices that were already checked in for this session.
+- `unknown` — devices whose UUID is not registered.
+
+**Errors**
+- `400` — Missing `session_code` or malformed `items`
+- `404` — Session code not found, inactive, or expired
+
 ### `GET /attendance/session/:id`
 
 List all check-ins for a specific session, joined with participant

@@ -226,7 +226,7 @@ static void base64_encode(const uint8_t *in, int len, char *out) {
  * Bucket array is fixed size (256 entries, hash collision = LRU evict). */
 #define RL_BUCKETS 256
 #define RL_WINDOW_SEC 60
-#define RL_DEFAULT_LIMIT 60        /* most endpoints */
+#define RL_DEFAULT_LIMIT 600       /* most endpoints — generous for shared NAT */
 #define RL_AUTH_LIMIT 10           /* auth endpoints (anti brute force) */
 
 typedef struct {
@@ -989,6 +989,189 @@ static void handle_attendance_checkin(int fd, const char *headers, const char *b
     send_json(fd, 201, "Created", buf);
 }
 
+/* ─── Quick Check-in: device-keyed, no auth round trip ─────────────────
+ * The PRIMARY high-throughput path for 2000 simultaneous attendees.
+ *
+ * Once a participant has registered + linked their device once, the PWA
+ * stores device_uuid in localStorage and uses this endpoint exclusively.
+ *
+ * Performance: ONE SQL statement, ONE round trip — no JWT verify (HMAC),
+ * no separate session lookup, no separate device lookup, no separate insert.
+ * The CTE resolves all three in a single transaction.
+ *
+ * Body: {"session_code":"ABC12345","device_uuid":"dev-xxx"}
+ * Returns 201 with attendance row, 404 if device unknown / session bad,
+ *        409 if already checked in for this session. */
+static void handle_attendance_quick_checkin(int fd, const char *body) {
+    char session_code[64] = "", device_uuid[128] = "";
+    EXTRACT_JSON(body, "session_code", session_code, sizeof(session_code));
+    EXTRACT_JSON(body, "device_uuid", device_uuid, sizeof(device_uuid));
+
+    if (!session_code[0] || !device_uuid[0]) {
+        send_json(fd, 400, "Bad Request",
+            "{\"error\":\"session_code and device_uuid are required\"}");
+        return;
+    }
+
+    PGconn *conn = db_connect();
+    if (!conn) {
+        send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}");
+        return;
+    }
+
+    /* Single CTE: device → participant + session → insert.
+     * If device or session missing/expired, RETURNING is empty → handled below.
+     * UNIQUE(participant_id, session_id) gives 409 on duplicate. */
+    const char *params[2] = { device_uuid, session_code };
+    PGresult *r = PQexecParams(conn,
+        "WITH d AS (SELECT participant_id FROM \"Device\" WHERE device_uuid = $1), "
+        "     s AS (SELECT id FROM \"Session\" WHERE code = $2 AND active = true AND expires_at > NOW()) "
+        "INSERT INTO \"Attendance\" (participant_id, session_id, device_id, \"checkedInAt\") "
+        "SELECT d.participant_id, s.id, $1, NOW() FROM d, s "
+        "RETURNING id, participant_id, session_id, \"checkedInAt\"",
+        2, NULL, params, NULL, NULL, 0);
+
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+        const char *sqlstate = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+        PQclear(r); PQfinish(conn);
+        if (sqlstate && strcmp(sqlstate, "23505") == 0) {
+            send_json(fd, 409, "Conflict",
+                "{\"error\":\"already checked in for this session\"}");
+        } else {
+            send_json(fd, 500, "Internal Server Error", "{\"error\":\"checkin failed\"}");
+        }
+        return;
+    }
+
+    if (PQntuples(r) == 0) {
+        /* Either device not linked or session not found/expired — distinguish for UX */
+        PQclear(r);
+        const char *p1[1] = { device_uuid };
+        PGresult *dr = PQexecParams(conn,
+            "SELECT 1 FROM \"Device\" WHERE device_uuid = $1", 1, NULL, p1, NULL, NULL, 0);
+        int device_known = (PQresultStatus(dr) == PGRES_TUPLES_OK && PQntuples(dr) > 0);
+        PQclear(dr);
+        PQfinish(conn);
+        if (!device_known) {
+            send_json(fd, 401, "Unauthorized",
+                "{\"error\":\"device not linked, please register first\"}");
+        } else {
+            send_json(fd, 404, "Not Found",
+                "{\"error\":\"session not found, inactive, or expired\"}");
+        }
+        return;
+    }
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"id\":%s,\"participant_id\":%s,\"session_id\":%s,\"checkedInAt\":\"%s\"}",
+        PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1),
+        PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3));
+    PQclear(r); PQfinish(conn);
+    send_json(fd, 201, "Created", buf);
+}
+
+/* ─── Batch Check-in: admin-only bulk ingest ───────────────────────────
+ * Used by the scanner PWA's offline queue when it comes back online — instead
+ * of N individual HTTP calls, drains the queue in one round trip.
+ *
+ * Body: {"session_code":"ABC","items":[{"device_uuid":"dev-1"},{"device_uuid":"dev-2"},...]}
+ * Returns 200 with {"accepted":N,"duplicates":M,"unknown":K}. */
+static void handle_attendance_batch_checkin(int fd, const char *body) {
+    char session_code[64] = "";
+    EXTRACT_JSON(body, "session_code", session_code, sizeof(session_code));
+    if (!session_code[0]) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"session_code is required\"}");
+        return;
+    }
+
+    /* Parse items[] — find each "device_uuid":"..." occurrence inside the items array */
+    const char *items_start = strstr(body, "\"items\"");
+    if (!items_start) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"items array is required\"}");
+        return;
+    }
+    const char *arr_open = strchr(items_start, '[');
+    const char *arr_close = arr_open ? strchr(arr_open, ']') : NULL;
+    if (!arr_open || !arr_close) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"items must be an array\"}");
+        return;
+    }
+
+    PGconn *conn = db_connect();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+
+    /* Resolve session once */
+    const char *p1[1] = { session_code };
+    PGresult *sr = PQexecParams(conn,
+        "SELECT id FROM \"Session\" WHERE code = $1 AND active = true AND expires_at > NOW()",
+        1, NULL, p1, NULL, NULL, 0);
+    if (PQresultStatus(sr) != PGRES_TUPLES_OK || PQntuples(sr) == 0) {
+        PQclear(sr); PQfinish(conn);
+        send_json(fd, 404, "Not Found", "{\"error\":\"session not found, inactive, or expired\"}");
+        return;
+    }
+    char session_id[16];
+    strncpy(session_id, PQgetvalue(sr, 0, 0), sizeof(session_id) - 1);
+    session_id[sizeof(session_id) - 1] = 0;
+    PQclear(sr);
+
+    int accepted = 0, duplicates = 0, unknown = 0;
+
+    /* Wrap in a single transaction for speed */
+    PQexec(conn, "BEGIN");
+
+    const char *p = arr_open;
+    while (p && p < arr_close) {
+        const char *key = strstr(p, "\"device_uuid\"");
+        if (!key || key >= arr_close) break;
+        const char *colon = strchr(key, ':');
+        if (!colon) break;
+        const char *q1 = strchr(colon, '"');
+        if (!q1 || q1 >= arr_close) break;
+        const char *q2 = strchr(q1 + 1, '"');
+        if (!q2 || q2 >= arr_close) break;
+        char duuid[128];
+        int len = q2 - q1 - 1;
+        if (len <= 0 || len >= (int)sizeof(duuid)) { p = q2 + 1; continue; }
+        memcpy(duuid, q1 + 1, len);
+        duuid[len] = 0;
+
+        const char *params[3] = { duuid, session_id, duuid };
+        PGresult *r = PQexecParams(conn,
+            "INSERT INTO \"Attendance\" (participant_id, session_id, device_id, \"checkedInAt\") "
+            "SELECT participant_id, $2::int, $3, NOW() FROM \"Device\" WHERE device_uuid = $1 "
+            "ON CONFLICT (participant_id, session_id) DO NOTHING "
+            "RETURNING id",
+            3, NULL, params, NULL, NULL, 0);
+        if (PQresultStatus(r) == PGRES_TUPLES_OK) {
+            if (PQntuples(r) > 0) accepted++;
+            else {
+                /* Either device unknown or duplicate — disambiguate with cheap check */
+                PGresult *dr = PQexecParams(conn,
+                    "SELECT 1 FROM \"Device\" WHERE device_uuid = $1",
+                    1, NULL, &params[0], NULL, NULL, 0);
+                if (PQresultStatus(dr) == PGRES_TUPLES_OK && PQntuples(dr) > 0) duplicates++;
+                else unknown++;
+                PQclear(dr);
+            }
+        } else {
+            unknown++;
+        }
+        PQclear(r);
+        p = q2 + 1;
+    }
+
+    PQexec(conn, "COMMIT");
+    PQfinish(conn);
+
+    char out[128];
+    snprintf(out, sizeof(out),
+        "{\"accepted\":%d,\"duplicates\":%d,\"unknown\":%d}",
+        accepted, duplicates, unknown);
+    send_json(fd, 200, "OK", out);
+}
+
 static void handle_attendance_session(int fd, const char *headers, const char *id_str) {
     const char *token = extract_bearer(headers);
     if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
@@ -1431,6 +1614,150 @@ static void handle_participants_bulk(int fd, const char *headers, const char *bo
     send_json(fd, 200, "OK", resp);
 }
 
+/* ─── Stampede Seed (admin only) ──────────────────────────────────────
+ * Bulk-creates N synthetic participants and pre-linked devices in a
+ * single SQL transaction. Used exclusively by the load test harness so
+ * we can isolate the network/check-in path from the auth/register path.
+ *
+ * Body: {"n": 2000, "run_id": "abc123"}
+ *
+ * Convention used by the test runner:
+ *   email       = stamp-<run_id>-<i>@test.local
+ *   device_uuid = dev-stamp-<run_id>-<participant_id>
+ *
+ * Idempotent on email/device_uuid via ON CONFLICT.
+ *
+ * Returns: {"created":N, "devices":N}                                  */
+static void handle_participants_seed_stamp(int fd, const char *headers, const char *body) {
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int user_id = verify_token(token, role);
+    if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin only\"}"); return; }
+
+    char n_str[16] = "", run_id[64] = "";
+    EXTRACT_JSON(body, "n", n_str, sizeof(n_str));
+    EXTRACT_JSON(body, "run_id", run_id, sizeof(run_id));
+    int n = atoi(n_str);
+    if (n <= 0 || n > 5000 || !run_id[0]) {
+        send_json(fd, 400, "Bad Request",
+            "{\"error\":\"n (1-5000) and run_id required\"}");
+        return;
+    }
+
+    /* Validate run_id is alphanumeric/underscore/dash (no SQL injection) */
+    for (const char *c = run_id; *c; c++) {
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+              (*c >= '0' && *c <= '9') || *c == '_' || *c == '-')) {
+            send_json(fd, 400, "Bad Request", "{\"error\":\"run_id must be alphanumeric\"}");
+            return;
+        }
+    }
+
+    PGconn *conn = db_connect();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+
+    PQexec(conn, "BEGIN");
+
+    char n_buf[16];
+    snprintf(n_buf, sizeof(n_buf), "%d", n);
+    const char *p1[2] = { n_buf, run_id };
+    PGresult *r = PQexecParams(conn,
+        "INSERT INTO \"Participant\" (name, email, team, password_hash, role, "
+        "\"createdAt\", \"updatedAt\") "
+        "SELECT 'Stamp ' || i, "
+        "       'stamp-' || $2 || '-' || i || '@test.local', "
+        "       'T' || (i % 50), 'x', 'participant', NOW(), NOW() "
+        "FROM generate_series(0, $1::int - 1) AS s(i) "
+        "ON CONFLICT (email) DO NOTHING",
+        2, NULL, p1, NULL, NULL, 0);
+    if (PQresultStatus(r) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "seed participants: %s\n", PQresultErrorMessage(r));
+        PQclear(r);
+        PQexec(conn, "ROLLBACK");
+        PQfinish(conn);
+        send_json(fd, 500, "Internal Server Error", "{\"error\":\"participant seed failed\"}");
+        return;
+    }
+    PQclear(r);
+
+    const char *p2[1] = { run_id };
+    r = PQexecParams(conn,
+        "INSERT INTO \"Device\" (device_uuid, participant_id, user_agent, \"linkedAt\") "
+        "SELECT 'dev-stamp-' || $1 || '-' || p.id, p.id, 'stampede-seed', NOW() "
+        "FROM \"Participant\" p "
+        "WHERE p.email LIKE 'stamp-' || $1 || '-%@test.local' "
+        "ON CONFLICT (device_uuid) DO NOTHING",
+        1, NULL, p2, NULL, NULL, 0);
+    if (PQresultStatus(r) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "seed devices: %s\n", PQresultErrorMessage(r));
+        PQclear(r);
+        PQexec(conn, "ROLLBACK");
+        PQfinish(conn);
+        send_json(fd, 500, "Internal Server Error", "{\"error\":\"device seed failed\"}");
+        return;
+    }
+    PQclear(r);
+
+    PQexec(conn, "COMMIT");
+
+    /* Report counts */
+    r = PQexecParams(conn,
+        "SELECT (SELECT COUNT(*) FROM \"Participant\" WHERE email LIKE 'stamp-' || $1 || '-%@test.local')::int, "
+        "       (SELECT COUNT(*) FROM \"Device\"      WHERE device_uuid LIKE 'dev-stamp-' || $1 || '-%')::int",
+        1, NULL, p2, NULL, NULL, 0);
+    char buf[128] = "{\"created\":0,\"devices\":0}";
+    if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0) {
+        snprintf(buf, sizeof(buf),
+            "{\"created\":%s,\"devices\":%s,\"run_id\":\"%s\"}",
+            PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), run_id);
+    }
+    PQclear(r);
+    PQfinish(conn);
+    send_json(fd, 200, "OK", buf);
+}
+
+/* Cleanup helper for stampede seeds — admin only.
+ * Deletes all attendance, devices, and participants matching a run_id. */
+static void handle_participants_seed_cleanup(int fd, const char *headers, const char *body) {
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int user_id = verify_token(token, role);
+    if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin only\"}"); return; }
+
+    char run_id[64] = "";
+    EXTRACT_JSON(body, "run_id", run_id, sizeof(run_id));
+    if (!run_id[0]) { send_json(fd, 400, "Bad Request", "{\"error\":\"run_id required\"}"); return; }
+    for (const char *c = run_id; *c; c++) {
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+              (*c >= '0' && *c <= '9') || *c == '_' || *c == '-')) {
+            send_json(fd, 400, "Bad Request", "{\"error\":\"run_id must be alphanumeric\"}");
+            return;
+        }
+    }
+
+    PGconn *conn = db_connect();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+    PQexec(conn, "BEGIN");
+    const char *p1[1] = { run_id };
+    PQexecParams(conn,
+        "DELETE FROM \"Attendance\" WHERE participant_id IN "
+        "(SELECT id FROM \"Participant\" WHERE email LIKE 'stamp-' || $1 || '-%@test.local')",
+        1, NULL, p1, NULL, NULL, 0);
+    PQexecParams(conn,
+        "DELETE FROM \"Device\" WHERE device_uuid LIKE 'dev-stamp-' || $1 || '-%'",
+        1, NULL, p1, NULL, NULL, 0);
+    PQexecParams(conn,
+        "DELETE FROM \"Participant\" WHERE email LIKE 'stamp-' || $1 || '-%@test.local'",
+        1, NULL, p1, NULL, NULL, 0);
+    PQexec(conn, "COMMIT");
+    PQfinish(conn);
+    send_json(fd, 200, "OK", "{\"cleaned\":true}");
+}
+
 /* ─── Attendance CSV Export (Admin Only) ──────────────────────────────── */
 
 static void handle_attendance_export(int fd, const char *headers, const char *id_str) {
@@ -1871,6 +2198,9 @@ static void handle_request(int fd, const char *method, const char *path,
         if (strcmp(path, "/events") == 0) { handle_event_create(fd, headers, body); return; }
         /* Bulk participant import */
         if (strcmp(path, "/participants/bulk") == 0) { handle_participants_bulk(fd, headers, body); return; }
+        /* Stampede load-test seed (admin only) */
+        if (strcmp(path, "/participants/seed-stamp") == 0) { handle_participants_seed_stamp(fd, headers, body); return; }
+        if (strcmp(path, "/participants/seed-cleanup") == 0) { handle_participants_seed_cleanup(fd, headers, body); return; }
         if (strncmp(path, "/sessions/", 10) == 0) {
             /* Check for /sessions/:id/refresh */
             const char *rest = path + 10;
@@ -1889,6 +2219,17 @@ static void handle_request(int fd, const char *method, const char *path,
         /* Attendance */
         if (strcmp(path, "/attendance/checkin") == 0) {
             handle_attendance_checkin(fd, headers, body);
+            return;
+        }
+        /* High-throughput path: device-keyed, no auth round trip.
+         * Used by scanner PWA after device is linked once. */
+        if (strcmp(path, "/attendance/quick-checkin") == 0) {
+            handle_attendance_quick_checkin(fd, body);
+            return;
+        }
+        /* Bulk drain for offline queue — single transaction */
+        if (strcmp(path, "/attendance/batch-checkin") == 0) {
+            handle_attendance_batch_checkin(fd, body);
             return;
         }
         /* Device */
@@ -2017,8 +2358,18 @@ int main(void) {
             struct in_addr ia;
             if (inet_aton(ip_str, &ia)) client_ip = ia.s_addr;
         }
+        /* Rate limiting strategy:
+         *   /auth/...        -> 10/min (anti brute force)
+         *   /attendance/...  -> UNLIMITED (PRIMARY GOAL: 2000 concurrent check-ins,
+         *                      all attendees share one venue WiFi IP, can't throttle)
+         *   /ws/...          -> UNLIMITED (long-lived connections, fork()ed)
+         *   /deploy/...      -> UNLIMITED (auth via secret query param)
+         *   everything else  -> 600/min (admin operations, generous) */
+        int skip_rl = (strncmp(path, "/attendance/", 12) == 0) ||
+                      (strncmp(path, "/ws/", 4) == 0) ||
+                      (strncmp(path, "/deploy/", 8) == 0);
         int rl_limit = (strncmp(path, "/auth/", 6) == 0) ? RL_AUTH_LIMIT : RL_DEFAULT_LIMIT;
-        if (!rate_limit_check(client_ip, rl_limit)) {
+        if (!skip_rl && !rate_limit_check(client_ip, rl_limit)) {
             send_rate_limited(client_fd);
         } else {
             handle_request(client_fd, method, path, buf, body);
