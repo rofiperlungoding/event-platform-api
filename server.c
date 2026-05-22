@@ -1592,7 +1592,18 @@ static void handle_ws_attendance(int fd, const char *headers, const char *id_str
         if (p) {
             p += 6;
             int i = 0;
-            while (*p && *p != '&' && *p != ' ' && i < (int)sizeof(token) - 1) token[i++] = *p++;
+            /* URL-decode while reading: %3A → ':' */
+            while (*p && *p != '&' && *p != ' ' && i < (int)sizeof(token) - 1) {
+                if (*p == '%' && p[1] && p[2]) {
+                    char hex[3] = { p[1], p[2], 0 };
+                    token[i++] = (char)strtol(hex, NULL, 16);
+                    p += 3;
+                } else if (*p == '+') {
+                    token[i++] = ' '; p++;
+                } else {
+                    token[i++] = *p++;
+                }
+            }
             token[i] = 0;
         }
     }

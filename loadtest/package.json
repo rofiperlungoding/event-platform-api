@@ -1,0 +1,8 @@
+{
+  "name": "event-platform-loadtest",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "ws": "^8.20.1"
+  }
+}
