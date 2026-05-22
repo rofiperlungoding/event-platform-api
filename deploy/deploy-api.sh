@@ -82,12 +82,17 @@ ls -t "$ARCHIVE"/event-server-* 2>/dev/null | tail -n +6 | xargs -r rm -f 2>/dev
 
 # 5. Atomic swap + restart
 # pm2 must stop first to release the binary file lock on Termux
-pm2 stop event-server >> "$LOG" 2>&1
+pm2 stop event-server >> "$LOG" 2>&1 || true
 sleep 2
-mv event-server-staging "$BIN_DIR/event-server"
+mv event-server-staging "$BIN_DIR/event-server" || {
+    echo "[$(date)] ❌ mv failed — attempting cp instead" >> "$LOG"
+    cat event-server-staging > "$BIN_DIR/event-server"
+    chmod +x "$BIN_DIR/event-server"
+    rm -f event-server-staging
+}
 echo "[$(date)] Atomic swap done" >> "$LOG"
 
-pm2 restart event-server --update-env >> "$LOG" 2>&1
+pm2 restart event-server --update-env >> "$LOG" 2>&1 || pm2 start "$BIN_DIR/event-server" --name event-server --interpreter none >> "$LOG" 2>&1
 sleep 3
 
 # Final health check on real port
