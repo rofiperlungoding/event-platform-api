@@ -134,6 +134,92 @@ static int json_escape(char *dst, int max, const char *src) {
 
 /* ─── Token / Auth Helpers ────────────────────────────────────────────── */
 
+/* ─── SHA-1 (RFC 3174) — for WebSocket handshake ─────────────────────── */
+typedef struct { uint32_t state[5]; uint64_t bytes; uint8_t buf[64]; int idx; } sha1_ctx;
+
+static uint32_t sha1_rol(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+
+static void sha1_block(sha1_ctx *c, const uint8_t *block) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++) {
+        w[i] = (block[i*4] << 24) | (block[i*4+1] << 16) | (block[i*4+2] << 8) | block[i*4+3];
+    }
+    for (int i = 16; i < 80; i++) w[i] = sha1_rol(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+
+    uint32_t a = c->state[0], b = c->state[1], cc = c->state[2], d = c->state[3], e = c->state[4];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20)      { f = (b & cc) | (~b & d); k = 0x5A827999; }
+        else if (i < 40) { f = b ^ cc ^ d;          k = 0x6ED9EBA1; }
+        else if (i < 60) { f = (b & cc) | (b & d) | (cc & d); k = 0x8F1BBCDC; }
+        else             { f = b ^ cc ^ d;          k = 0xCA62C1D6; }
+        uint32_t t = sha1_rol(a, 5) + f + e + k + w[i];
+        e = d; d = cc; cc = sha1_rol(b, 30); b = a; a = t;
+    }
+    c->state[0] += a; c->state[1] += b; c->state[2] += cc; c->state[3] += d; c->state[4] += e;
+}
+
+static void sha1_init(sha1_ctx *c) {
+    c->state[0] = 0x67452301; c->state[1] = 0xEFCDAB89;
+    c->state[2] = 0x98BADCFE; c->state[3] = 0x10325476; c->state[4] = 0xC3D2E1F0;
+    c->bytes = 0; c->idx = 0;
+}
+
+static void sha1_update(sha1_ctx *c, const uint8_t *data, int len) {
+    c->bytes += len;
+    while (len > 0) {
+        int take = 64 - c->idx;
+        if (take > len) take = len;
+        memcpy(c->buf + c->idx, data, take);
+        c->idx += take; data += take; len -= take;
+        if (c->idx == 64) { sha1_block(c, c->buf); c->idx = 0; }
+    }
+}
+
+static void sha1_final(sha1_ctx *c, uint8_t out[20]) {
+    uint64_t bits = c->bytes * 8;
+    c->buf[c->idx++] = 0x80;
+    if (c->idx > 56) {
+        while (c->idx < 64) c->buf[c->idx++] = 0;
+        sha1_block(c, c->buf); c->idx = 0;
+    }
+    while (c->idx < 56) c->buf[c->idx++] = 0;
+    for (int i = 7; i >= 0; i--) c->buf[c->idx++] = (bits >> (i * 8)) & 0xff;
+    sha1_block(c, c->buf);
+    for (int i = 0; i < 5; i++) {
+        out[i*4]   = (c->state[i] >> 24) & 0xff;
+        out[i*4+1] = (c->state[i] >> 16) & 0xff;
+        out[i*4+2] = (c->state[i] >> 8) & 0xff;
+        out[i*4+3] =  c->state[i] & 0xff;
+    }
+}
+
+/* ─── Base64 encoder ──────────────────────────────────────────────────── */
+static void base64_encode(const uint8_t *in, int len, char *out) {
+    static const char alpha[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int i, j = 0;
+    for (i = 0; i + 2 < len; i += 3) {
+        out[j++] = alpha[(in[i] >> 2) & 0x3f];
+        out[j++] = alpha[((in[i] << 4) | (in[i+1] >> 4)) & 0x3f];
+        out[j++] = alpha[((in[i+1] << 2) | (in[i+2] >> 6)) & 0x3f];
+        out[j++] = alpha[in[i+2] & 0x3f];
+    }
+    if (i < len) {
+        out[j++] = alpha[(in[i] >> 2) & 0x3f];
+        if (i + 1 < len) {
+            out[j++] = alpha[((in[i] << 4) | (in[i+1] >> 4)) & 0x3f];
+            out[j++] = alpha[(in[i+1] << 2) & 0x3f];
+            out[j++] = '=';
+        } else {
+            out[j++] = alpha[(in[i] << 4) & 0x3f];
+            out[j++] = '=';
+            out[j++] = '=';
+        }
+    }
+    out[j] = 0;
+}
+
+
 /* ─── Rate Limiter (per-IP, in-memory token bucket) ─────────────────────
  * Simple fixed-window: each IP gets N tokens per window.
  * Limits chosen for ~50 active users/IP — admin operations, scanner PWA.
@@ -1461,6 +1547,190 @@ static void handle_session_scheduled(int fd, const char *headers, const char *bo
     send_json(fd, 201, "Created", resp);
 }
 
+/* ─── WebSocket Live Attendance Feed ──────────────────────────────────── */
+/* Implementation of RFC 6455 (WebSocket protocol) — minimal text-frame
+ * server. Supports the upgrade handshake and server-to-client text
+ * frames. Used to push attendance check-in events to the admin
+ * dashboard in near-real-time.
+ *
+ * Endpoint: GET /ws/attendance/:session_id
+ *   - Upgrades to WebSocket
+ *   - Polls the database every 2 seconds for new check-ins
+ *   - Pushes JSON frames as new entries appear
+ *   - Closes when client disconnects */
+
+static int ws_send_text_frame(int fd, const char *data, int len) {
+    /* Server frames: FIN=1, opcode=1 (text), no mask. */
+    uint8_t hdr[10];
+    int hlen;
+    hdr[0] = 0x81;  /* FIN | text */
+    if (len < 126) {
+        hdr[1] = (uint8_t)len;
+        hlen = 2;
+    } else if (len < 65536) {
+        hdr[1] = 126;
+        hdr[2] = (len >> 8) & 0xff;
+        hdr[3] = len & 0xff;
+        hlen = 4;
+    } else {
+        hdr[1] = 127;
+        for (int i = 0; i < 8; i++) hdr[2 + i] = (len >> ((7 - i) * 8)) & 0xff;
+        hlen = 10;
+    }
+    if (write(fd, hdr, hlen) != hlen) return -1;
+    if (write(fd, data, len) != len) return -1;
+    return 0;
+}
+
+static void handle_ws_attendance(int fd, const char *headers, const char *id_str) {
+    /* Verify token from query parameter ?token=... since browser WebSocket
+     * cannot send arbitrary headers. */
+    const char *q = strchr(id_str, '?');
+    char token[256] = {0};
+    if (q) {
+        const char *p = strstr(q, "token=");
+        if (p) {
+            p += 6;
+            int i = 0;
+            while (*p && *p != '&' && *p != ' ' && i < (int)sizeof(token) - 1) token[i++] = *p++;
+            token[i] = 0;
+        }
+    }
+    if (!token[0]) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int user_id = verify_token(token, role);
+    if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin only\"}"); return; }
+
+    /* Parse session id from the path prefix */
+    char session_id[16] = {0};
+    int si = 0;
+    while (id_str[si] && id_str[si] != '?' && si < (int)sizeof(session_id) - 1) {
+        session_id[si] = id_str[si]; si++;
+    }
+    session_id[si] = 0;
+
+    /* Extract Sec-WebSocket-Key */
+    const char *key_hdr = strcasestr(headers, "Sec-WebSocket-Key:");
+    if (!key_hdr) { send_json(fd, 400, "Bad Request", "{\"error\":\"not a websocket request\"}"); return; }
+    key_hdr += 18;
+    while (*key_hdr == ' ') key_hdr++;
+    char ws_key[64] = {0};
+    int ki = 0;
+    while (*key_hdr && *key_hdr != '\r' && *key_hdr != '\n' && ki < (int)sizeof(ws_key) - 1) {
+        ws_key[ki++] = *key_hdr++;
+    }
+    ws_key[ki] = 0;
+
+    /* Compute Sec-WebSocket-Accept = base64(SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")) */
+    char concat[256];
+    int clen = snprintf(concat, sizeof(concat), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", ws_key);
+    sha1_ctx sc;
+    sha1_init(&sc);
+    sha1_update(&sc, (uint8_t *)concat, clen);
+    uint8_t digest[20];
+    sha1_final(&sc, digest);
+    char accept_b64[40];
+    base64_encode(digest, 20, accept_b64);
+
+    /* Send upgrade response */
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n\r\n",
+        accept_b64);
+    if (write(fd, hdr, hlen) != hlen) return;
+
+    /* Send hello frame so client knows we're alive */
+    char hello[128];
+    snprintf(hello, sizeof(hello),
+        "{\"event\":\"connected\",\"session_id\":%s,\"timestamp\":\"%ld\"}",
+        session_id, (long)time(NULL));
+    ws_send_text_frame(fd, hello, strlen(hello));
+
+    /* Push loop: poll attendance every 2s, send new entries.
+     * To keep it simple, track the highest attendance.id we've pushed. */
+    long last_id = 0;
+
+    /* Get current max id so we only send new ones */
+    PGconn *conn = db_connect();
+    if (conn) {
+        const char *params[1] = { session_id };
+        PGresult *r = PQexecParams(conn,
+            "SELECT COALESCE(MAX(id), 0) FROM \"Attendance\" WHERE session_id = $1",
+            1, NULL, params, NULL, NULL, 0);
+        if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0) {
+            last_id = atol(PQgetvalue(r, 0, 0));
+        }
+        PQclear(r);
+        PQfinish(conn);
+    }
+
+    /* Configure socket for non-blocking-style read with timeout for ping detection */
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int idle_seconds = 0;
+    while (idle_seconds < 600) {  /* max 10 min idle */
+        sleep(2);
+
+        conn = db_connect();
+        if (!conn) { idle_seconds += 2; continue; }
+
+        char last_str[32];
+        snprintf(last_str, sizeof(last_str), "%ld", last_id);
+        const char *params[2] = { session_id, last_str };
+        PGresult *r = PQexecParams(conn,
+            "SELECT a.id, a.participant_id, p.name, p.email, p.team, "
+            "a.device_id, a.\"checkedInAt\" "
+            "FROM \"Attendance\" a JOIN \"Participant\" p ON p.id = a.participant_id "
+            "WHERE a.session_id = $1 AND a.id > $2 ORDER BY a.id ASC",
+            2, NULL, params, NULL, NULL, 0);
+
+        int new_rows = 0;
+        if (PQresultStatus(r) == PGRES_TUPLES_OK) {
+            new_rows = PQntuples(r);
+            for (int i = 0; i < new_rows; i++) {
+                char ename[256], eemail[256], eteam[128];
+                json_escape(ename, sizeof(ename), PQgetvalue(r, i, 2));
+                json_escape(eemail, sizeof(eemail), PQgetvalue(r, i, 3));
+                json_escape(eteam, sizeof(eteam), PQgetvalue(r, i, 4));
+                char frame[1024];
+                int flen = snprintf(frame, sizeof(frame),
+                    "{\"event\":\"checkin\",\"id\":%s,\"participant_id\":%s,"
+                    "\"name\":\"%s\",\"email\":\"%s\",\"team\":\"%s\","
+                    "\"device_id\":\"%s\",\"checkedInAt\":\"%s\"}",
+                    PQgetvalue(r, i, 0), PQgetvalue(r, i, 1), ename, eemail,
+                    eteam, PQgetvalue(r, i, 5), PQgetvalue(r, i, 6));
+                if (ws_send_text_frame(fd, frame, flen) < 0) {
+                    PQclear(r); PQfinish(conn);
+                    return;  /* Client disconnected */
+                }
+                last_id = atol(PQgetvalue(r, i, 0));
+            }
+        }
+        PQclear(r);
+        PQfinish(conn);
+
+        if (new_rows > 0) {
+            idle_seconds = 0;
+        } else {
+            idle_seconds += 2;
+            /* Send heartbeat every 30s so client knows we're still alive */
+            if (idle_seconds % 30 == 0) {
+                const char *hb = "{\"event\":\"heartbeat\"}";
+                if (ws_send_text_frame(fd, hb, strlen(hb)) < 0) return;
+            }
+        }
+    }
+
+    /* Send close frame */
+    uint8_t close_frame[] = { 0x88, 0x02, 0x03, 0xE8 };  /* opcode 0x8 (close), code 1000 */
+    write(fd, close_frame, sizeof(close_frame));
+}
+
 /* ─── Static File Serving ─────────────────────────────────────────────── */
 
 static void serve_static(int fd, const char *path) {
@@ -1547,6 +1817,11 @@ static void handle_request(int fd, const char *method, const char *path,
             return;
         }
         if (strcmp(path, "/attendance/me") == 0) { handle_attendance_me(fd, headers); return; }
+        /* WebSocket live feed */
+        if (strncmp(path, "/ws/attendance/", 15) == 0) {
+            handle_ws_attendance(fd, headers, path + 15);
+            return;
+        }
         /* Device */
         if (strcmp(path, "/device/identify") == 0) { handle_device_identify(fd, body); return; }
 
