@@ -29,6 +29,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
@@ -132,6 +133,56 @@ static int json_escape(char *dst, int max, const char *src) {
 }
 
 /* ─── Token / Auth Helpers ────────────────────────────────────────────── */
+
+/* ─── Rate Limiter (per-IP, in-memory token bucket) ─────────────────────
+ * Simple fixed-window: each IP gets N tokens per window.
+ * Limits chosen for ~50 active users/IP — admin operations, scanner PWA.
+ * Bucket array is fixed size (256 entries, hash collision = LRU evict). */
+#define RL_BUCKETS 256
+#define RL_WINDOW_SEC 60
+#define RL_DEFAULT_LIMIT 60        /* most endpoints */
+#define RL_AUTH_LIMIT 10           /* /auth/* (anti brute force) */
+
+typedef struct {
+    uint32_t ip;
+    time_t   window_start;
+    int      count;
+} rl_entry;
+
+static rl_entry rl_table[RL_BUCKETS];
+
+/* Returns 1 if allowed, 0 if rate-limited */
+static int rate_limit_check(uint32_t ip, int limit) {
+    int slot = ip % RL_BUCKETS;
+    time_t now = time(NULL);
+    rl_entry *e = &rl_table[slot];
+
+    if (e->ip != ip || (now - e->window_start) >= RL_WINDOW_SEC) {
+        e->ip = ip;
+        e->window_start = now;
+        e->count = 1;
+        return 1;
+    }
+    e->count++;
+    return e->count <= limit;
+}
+
+/* Send 429 with Retry-After header */
+static void send_rate_limited(int fd) {
+    const char *body = "{\"error\":\"rate limit exceeded, retry shortly\"}";
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 429 Too Many Requests\r\n"
+        "%s"
+        "Content-Type: application/json\r\n"
+        "Retry-After: 60\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        cors_headers, strlen(body));
+    write(fd, hdr, hlen);
+    write(fd, body, strlen(body));
+}
+
 
 /* Growable string buffer — prevents overflow on large result sets */
 typedef struct { char *data; int len; int cap; } strbuf;
@@ -1102,6 +1153,104 @@ static void handle_device_identify(int fd, const char *body) {
     send_json(fd, 200, "OK", buf);
 }
 
+/* ─── Event Endpoints (Admin Only) ────────────────────────────────────── */
+/* An Event is a top-level container (e.g., "Intrivia 2026"). Sessions
+ * and Participants may be scoped to a specific event. */
+
+static void handle_event_create(int fd, const char *headers, const char *body) {
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int user_id = verify_token(token, role);
+    if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
+
+    char slug[64] = "", name[256] = "", description[1024] = "", starts_at[64] = "", ends_at[64] = "";
+    EXTRACT_JSON(body, "slug", slug, sizeof(slug));
+    EXTRACT_JSON(body, "name", name, sizeof(name));
+    EXTRACT_JSON(body, "description", description, sizeof(description));
+    EXTRACT_JSON(body, "starts_at", starts_at, sizeof(starts_at));
+    EXTRACT_JSON(body, "ends_at", ends_at, sizeof(ends_at));
+
+    if (!slug[0] || !name[0]) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"slug and name are required\"}");
+        return;
+    }
+
+    PGconn *conn = db_connect();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+
+    char uid_str[16];
+    snprintf(uid_str, sizeof(uid_str), "%d", user_id);
+
+    const char *params[6] = {
+        slug, name,
+        description[0] ? description : NULL,
+        starts_at[0] ? starts_at : NULL,
+        ends_at[0] ? ends_at : NULL,
+        uid_str
+    };
+    PGresult *r = PQexecParams(conn,
+        "INSERT INTO \"Event\" (slug, name, description, starts_at, ends_at, created_by) "
+        "VALUES ($1, $2, $3, $4::timestamp, $5::timestamp, $6) "
+        "RETURNING id, slug, name, \"createdAt\"",
+        6, NULL, params, NULL, NULL, 0);
+
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+        const char *err = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+        PQclear(r); PQfinish(conn);
+        if (err && strcmp(err, "23505") == 0) {
+            send_json(fd, 409, "Conflict", "{\"error\":\"slug already in use\"}");
+        } else {
+            send_json(fd, 500, "Internal Server Error", "{\"error\":\"event creation failed\"}");
+        }
+        return;
+    }
+
+    char resp[512];
+    snprintf(resp, sizeof(resp),
+        "{\"id\":%s,\"slug\":\"%s\",\"name\":\"%s\",\"createdAt\":\"%s\"}",
+        PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1),
+        PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3));
+    PQclear(r); PQfinish(conn);
+    send_json(fd, 201, "Created", resp);
+}
+
+static void handle_events_list(int fd) {
+    PGconn *conn = db_connect();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+
+    PGresult *r = PQexec(conn,
+        "SELECT e.id, e.slug, e.name, COALESCE(e.description, ''), "
+        "COALESCE(e.starts_at::text, ''), COALESCE(e.ends_at::text, ''), "
+        "e.\"createdAt\", "
+        "(SELECT COUNT(*) FROM \"Participant\" WHERE event_id = e.id) AS pcount, "
+        "(SELECT COUNT(*) FROM \"Session\" WHERE event_id = e.id) AS scount "
+        "FROM \"Event\" e ORDER BY e.\"createdAt\" DESC");
+
+    strbuf sb; sb_init(&sb, 4096);
+    sb_append(&sb, "[");
+    if (PQresultStatus(r) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(r); i++) {
+            char ename[512], edesc[2048];
+            json_escape(ename, sizeof(ename), PQgetvalue(r, i, 2));
+            json_escape(edesc, sizeof(edesc), PQgetvalue(r, i, 3));
+            if (i > 0) sb_append(&sb, ",");
+            sb_appendf(&sb,
+                "{\"id\":%s,\"slug\":\"%s\",\"name\":\"%s\",\"description\":\"%s\","
+                "\"starts_at\":\"%s\",\"ends_at\":\"%s\",\"createdAt\":\"%s\","
+                "\"participant_count\":%s,\"session_count\":%s}",
+                PQgetvalue(r, i, 0), PQgetvalue(r, i, 1), ename, edesc,
+                PQgetvalue(r, i, 4), PQgetvalue(r, i, 5), PQgetvalue(r, i, 6),
+                PQgetvalue(r, i, 7), PQgetvalue(r, i, 8));
+        }
+    }
+    PQclear(r); PQfinish(conn);
+    sb_append(&sb, "]");
+    send_json(fd, 200, "OK", sb.data);
+    sb_free(&sb);
+}
+
 /* ─── Bulk Participant Import (Admin Only) ────────────────────────────── */
 /* Accepts CSV body with header line: name,email,team
  * Returns JSON summary: {"created":N, "skipped":M, "errors":[...]}    */
@@ -1365,6 +1514,7 @@ static void handle_request(int fd, const char *method, const char *path,
         if (strcmp(path, "/system") == 0) { handle_system(fd); return; }
         if (strcmp(path, "/stats/database") == 0) { handle_stats_database(fd); return; }
         if (strcmp(path, "/stats/participants") == 0) { handle_stats_participants(fd); return; }
+        if (strcmp(path, "/events") == 0) { handle_events_list(fd); return; }
         if (strcmp(path, "/participants") == 0) { handle_participants_list(fd); return; }
         if (strncmp(path, "/participants/", 14) == 0) {
             handle_participant_get(fd, path + 14);
@@ -1421,6 +1571,8 @@ static void handle_request(int fd, const char *method, const char *path,
         /* Sessions */
         if (strcmp(path, "/sessions/create") == 0) { handle_session_create(fd, headers); return; }
         if (strcmp(path, "/sessions/scheduled") == 0) { handle_session_scheduled(fd, headers, body); return; }
+        /* Events */
+        if (strcmp(path, "/events") == 0) { handle_event_create(fd, headers, body); return; }
         /* Bulk participant import */
         if (strcmp(path, "/participants/bulk") == 0) { handle_participants_bulk(fd, headers, body); return; }
         if (strncmp(path, "/sessions/", 10) == 0) {
@@ -1549,7 +1701,27 @@ int main(void) {
         if (body) body += 4; else body = "";
 
         /* Pass full headers buffer for Authorization extraction */
-        handle_request(client_fd, method, path, buf, body);
+        /* Rate limit check — try CF-Connecting-IP first (real client IP),
+         * fall back to socket peer address (LAN clients). */
+        uint32_t client_ip = client_addr.sin_addr.s_addr;
+        const char *cf_ip = strcasestr(buf, "CF-Connecting-IP:");
+        if (cf_ip) {
+            cf_ip += 17;
+            while (*cf_ip == ' ') cf_ip++;
+            char ip_str[64] = {0};
+            int j = 0;
+            while (*cf_ip && *cf_ip != '\r' && *cf_ip != '\n' && j < (int)sizeof(ip_str) - 1) {
+                ip_str[j++] = *cf_ip++;
+            }
+            struct in_addr ia;
+            if (inet_aton(ip_str, &ia)) client_ip = ia.s_addr;
+        }
+        int rl_limit = (strncmp(path, "/auth/", 6) == 0) ? RL_AUTH_LIMIT : RL_DEFAULT_LIMIT;
+        if (!rate_limit_check(client_ip, rl_limit)) {
+            send_rate_limited(client_fd);
+        } else {
+            handle_request(client_fd, method, path, buf, body);
+        }
         close(client_fd);
     }
 
