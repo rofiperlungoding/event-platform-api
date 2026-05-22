@@ -2234,8 +2234,17 @@ static void serve_static(int fd, const char *path) {
         return;
     }
 
+    /* Strip query string before file lookup. Cache busters like
+     * styles.css?v=4 must resolve to styles.css on disk. */
+    char clean_path[MAX_PATH];
+    const char *q = strchr(path, '?');
+    int plen = q ? (int)(q - path) : (int)strlen(path);
+    if (plen >= (int)sizeof(clean_path)) plen = sizeof(clean_path) - 1;
+    memcpy(clean_path, path, plen);
+    clean_path[plen] = 0;
+
     char filepath[MAX_PATH];
-    const char *serve_path = (strcmp(path, "/") == 0) ? "/index.html" : path;
+    const char *serve_path = (strcmp(clean_path, "/") == 0) ? "/index.html" : clean_path;
     snprintf(filepath, sizeof(filepath), "%s%s", static_dir, serve_path);
 
     int file_fd = open(filepath, O_RDONLY);

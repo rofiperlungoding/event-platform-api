@@ -1,4 +1,4 @@
-/* Event Platform Console — vanilla JS, no build, no deps */
+/* Event Platform Console — vanilla JS, AWS-grade redesign */
 const API = 'https://api.rofidoesthings.site';
 const REFRESH_MS = 8000;
 
@@ -27,17 +27,35 @@ const fmtUptime = (sec) => {
 };
 
 const fmtTime = (iso) => {
+  if (!iso) return '—';
   const d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
   return d.toLocaleString(undefined, { hour12: false });
 };
 
 const fmtRel = (iso) => {
   const d = new Date(iso).getTime();
+  if (isNaN(d)) return '—';
   const diff = (Date.now() - d) / 1000;
   if (diff < 60) return `${Math.floor(diff)}s ago`;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
   return `${Math.floor(diff / 86400)}d ago`;
+};
+
+/* Threshold class for usage % values */
+const usageClass = (pct) => {
+  if (pct >= 90) return 'high';
+  if (pct >= 70) return 'warn';
+  return '';
+};
+
+/* Apply status accent to a stat-card by id */
+const applyStatus = (cardId, status) => {
+  const el = document.getElementById(cardId);
+  if (!el) return;
+  el.classList.remove('status-ok', 'status-warn', 'status-error', 'status-info', 'status-accent');
+  if (status) el.classList.add(`status-${status}`);
 };
 
 async function fetchJson(path) {
@@ -58,125 +76,158 @@ $$('.nav-item').forEach((el) => {
   });
 });
 
-// ─── Status pill ────────────────────────────────────────────────────────────
-function setStatus(ok, text) {
-  $('#status-dot').className = `status-dot ${ok ? 'ok' : 'error'}`;
-  $('#status-text').textContent = text;
+// ─── Status pill state machine ──────────────────────────────────────────────
+let lastSuccessfulRefresh = null;
+
+function setStatus(state, text) {
+  const dot = $('#status-dot');
+  const txt = $('#status-text');
+  dot.className = 'status-dot ' + state;       // connecting | ok | warn | error
+  txt.textContent = text;
 }
+
+/* Continuously update "Last updated: Xs ago" without re-fetching */
+function tickLastUpdate() {
+  if (!lastSuccessfulRefresh) return;
+  $('#last-update').textContent = `Last updated: ${fmtRel(lastSuccessfulRefresh)}`;
+}
+setInterval(tickLastUpdate, 1000);
 
 // ─── Renderers ──────────────────────────────────────────────────────────────
 function renderHealth(d) {
-  $('#kpi-status').textContent = d.status === 'healthy' ? 'Healthy' : 'Degraded';
-  $('#kpi-status-sub').textContent = `node ${d.node_version} · v${d.version}`;
-  $('#kpi-db-latency').textContent = d.checks.database.latency_ms;
+  // Status KPI card with semantic accent + value
+  const isHealthy = d.status === 'healthy';
+  $('#kpi-status').textContent = isHealthy ? 'Healthy' : 'Degraded';
+  $('#kpi-status-sub').textContent = `${d.node_version || 'native'} · v${d.version || '—'}`;
+  applyStatus('kpi-card-status', isHealthy ? 'ok' : 'error');
+
+  // DB latency
+  const dbLat = d.checks?.database?.latency_ms ?? 0;
+  $('#kpi-db-latency-wrap').innerHTML =
+    `<span>${dbLat}</span><span class="unit">ms</span>`;
+  applyStatus('kpi-card-latency', dbLat < 50 ? 'ok' : dbLat < 200 ? 'warn' : 'error');
+
+  // Uptime KPI
   $('#kpi-uptime').textContent = fmtUptime(d.uptime_seconds);
 
+  // Health checks badge — semantic
   const badge = $('#health-badge');
   badge.textContent = d.status;
-  badge.className = `badge ${d.status === 'healthy' ? 'ok' : 'err'}`;
+  badge.className = `badge ${isHealthy ? 'ok' : 'err'}`;
 
-  const rows = Object.entries(d.checks).map(([name, c]) => `
+  const rows = Object.entries(d.checks || {}).map(([name, c]) => `
     <tr>
-      <td>${name}</td>
+      <td>${escapeHtml(name)}</td>
       <td><span class="status-row">
         <span class="dot ${c.status === 'ok' ? '' : 'err'}"></span>
-        ${c.status}
+        ${escapeHtml(c.status)}
       </span></td>
       <td class="num">${c.latency_ms} ms</td>
     </tr>
-  `).join('');
+  `).join('') || `<tr><td colspan="3"><div class="empty-state"><span class="empty-icon">○</span>No health checks reported</div></td></tr>`;
   $('#health-table').innerHTML = rows;
 
   $('#meta-table').innerHTML = `
     <tr><td>Service</td><td>event-platform-api</td></tr>
-    <tr><td>Version</td><td>${d.version}</td></tr>
-    <tr><td>Node.js</td><td>${d.node_version}</td></tr>
+    <tr><td>Version</td><td>${escapeHtml(d.version || '—')}</td></tr>
+    <tr><td>Runtime</td><td>${escapeHtml(d.node_version || 'native-c')}</td></tr>
     <tr><td>Uptime</td><td>${fmtUptime(d.uptime_seconds)}</td></tr>
-    <tr><td>Last check</td><td>${fmtTime(d.timestamp)}</td></tr>
+    <tr><td>Last check</td><td>${fmtTime(d.timestamp || new Date().toISOString())}</td></tr>
   `;
 }
 
 function renderSystem(d) {
-  // Region info in topbar
+  // Topbar chips — show actual host info via colored pills
   const dev = d.device || {};
-  $('#region-text').textContent =
-    `${dev.brand ? dev.brand + ' ' : ''}${dev.model || d.hostname} · ${d.platform}-${d.arch}`;
+  const net = d.network || {};
+  const chips = [];
+  if (dev.brand || dev.model)
+    chips.push(`<span class="chip region"><span class="chip-dot"></span>${escapeHtml(((dev.brand || '') + ' ' + (dev.model || '')).trim())}</span>`);
+  if (d.platform) chips.push(`<span class="chip platform">${escapeHtml(d.platform)}</span>`);
+  if (d.arch)     chips.push(`<span class="chip arch">${escapeHtml(d.arch)}</span>`);
+  if (net.lan_ip) chips.push(`<span class="chip host">${escapeHtml(net.lan_ip)}:${net.port || 3001}</span>`);
+  if (chips.length) $('#region-chips').innerHTML = chips.join('');
 
-  $('#sys-cores').textContent = d.cpu.cores || '—';
-  $('#sys-cpu-model').textContent = d.cpu.model && d.cpu.model !== 'unknown'
+  $('#sys-cores').textContent = d.cpu?.cores ?? '—';
+  $('#sys-cpu-model').textContent = d.cpu?.model && d.cpu.model !== 'unknown'
     ? d.cpu.model.slice(0, 32) : `${d.platform}/${d.arch}`;
 
-  $('#sys-load').textContent = d.cpu.load_avg['1m'].toFixed(2);
+  const l1 = d.cpu?.load_avg?.['1m'] ?? 0;
+  $('#sys-load').textContent = l1.toFixed(2);
   $('#sys-load-detail').textContent =
-    `5m ${d.cpu.load_avg['5m'].toFixed(2)} · 15m ${d.cpu.load_avg['15m'].toFixed(2)}`;
+    `5m ${(d.cpu?.load_avg?.['5m'] ?? 0).toFixed(2)} · 15m ${(d.cpu?.load_avg?.['15m'] ?? 0).toFixed(2)}`;
+  /* Heuristic: load > cores = saturation */
+  const cores = d.cpu?.cores || 8;
+  applyStatus('sys-card-load', l1 > cores ? 'error' : l1 > cores * 0.7 ? 'warn' : 'ok');
 
-  // Memory KPI + bar
-  const usedPct = d.memory.used_percent;
+  // Memory KPI + bar with threshold class
+  const usedPct = d.memory?.used_percent ?? 0;
   $('#sys-mem-pct').textContent = usedPct.toFixed(1);
   $('#sys-mem-detail').textContent =
-    `${fmtBytes(d.memory.used_bytes)} of ${fmtBytes(d.memory.total_bytes)}`;
-  $('#mem-bar .seg-used').style.width = `${usedPct}%`;
-  $('#mem-bar .seg-free').style.width = `${100 - usedPct}%`;
+    `${fmtBytes(d.memory?.used_bytes)} of ${fmtBytes(d.memory?.total_bytes)}`;
+  const memBar = $('#mem-bar');
+  memBar.className = 'bar-stack ' + usageClass(usedPct);
+  memBar.querySelector('.seg-used').style.width = `${usedPct}%`;
+  memBar.querySelector('.seg-free').style.width = `${100 - usedPct}%`;
+  applyStatus('sys-card-mem', usageClass(usedPct) === 'high' ? 'error' : usageClass(usedPct) === 'warn' ? 'warn' : 'ok');
 
-  // Swap KPI + bar
-  const swap = d.swap || {used_percent: 0, total_bytes: 0, used_bytes: 0, free_bytes: 0};
+  // Swap
+  const swap = d.swap || {};
   const swapPct = swap.used_percent || 0;
   $('#sys-swap-pct').textContent = swapPct.toFixed(1);
   $('#sys-swap-detail').textContent = swap.total_bytes
     ? `${fmtBytes(swap.used_bytes)} of ${fmtBytes(swap.total_bytes)}`
     : 'no swap';
-  $('#swap-bar .seg-used').style.width = `${swapPct}%`;
-  $('#swap-bar .seg-free').style.width = `${100 - swapPct}%`;
+  const swapBar = $('#swap-bar');
+  swapBar.className = 'bar-stack ' + usageClass(swapPct);
+  swapBar.querySelector('.seg-used').style.width = `${swapPct}%`;
+  swapBar.querySelector('.seg-free').style.width = `${100 - swapPct}%`;
+  applyStatus('sys-card-swap', usageClass(swapPct) === 'high' ? 'error' : usageClass(swapPct) === 'warn' ? 'warn' : 'ok');
 
-  // Disk KPI + bar
-  const disk = d.disk || {used_percent: 0, total_bytes: 0, used_bytes: 0, free_bytes: 0};
+  // Disk
+  const disk = d.disk || {};
   const diskPct = disk.used_percent || 0;
   $('#sys-disk-pct').textContent = diskPct;
   $('#sys-disk-detail').textContent = disk.total_bytes
     ? `${fmtBytes(disk.used_bytes)} of ${fmtBytes(disk.total_bytes)}`
     : 'unknown';
-  $('#disk-bar .seg-used').style.width = `${diskPct}%`;
-  $('#disk-bar .seg-free').style.width = `${100 - diskPct}%`;
+  const diskBar = $('#disk-bar');
+  diskBar.className = 'bar-stack ' + usageClass(diskPct);
+  diskBar.querySelector('.seg-used').style.width = `${diskPct}%`;
+  diskBar.querySelector('.seg-free').style.width = `${100 - diskPct}%`;
+  applyStatus('sys-card-disk', usageClass(diskPct) === 'high' ? 'error' : usageClass(diskPct) === 'warn' ? 'warn' : 'ok');
 
-  // System uptime KPI
   const sysUp = d.uptime?.system_seconds || 0;
   $('#sys-uptime').textContent = fmtUptime(sysUp);
-  $('#sys-uptime-detail').textContent = sysUp
-    ? `process: ${fmtUptime(d.uptime.process_seconds)}`
-    : `process uptime: ${fmtUptime(d.uptime?.process_seconds || 0)}`;
+  $('#sys-uptime-detail').textContent = `process: ${fmtUptime(d.uptime?.process_seconds || 0)}`;
 
-  // Host details table — what the tablet actually is
-  const net = d.network || {};
   $('#host-table').innerHTML = `
-    <tr><td>Device</td><td>${escapeHtml((dev.brand || '') + ' ' + (dev.model || ''))}</td></tr>
+    <tr><td>Device</td><td>${escapeHtml(((dev.brand || '') + ' ' + (dev.model || '')).trim() || '—')}</td></tr>
     <tr><td>Android</td><td>${escapeHtml(dev.android_version || '?')}</td></tr>
-    <tr><td>Architecture</td><td>${escapeHtml(d.platform)}/${escapeHtml(d.arch)}</td></tr>
-    <tr><td>CPU</td><td>${escapeHtml(d.cpu.model)} · ${d.cpu.cores} cores</td></tr>
-    <tr><td>Hostname</td><td><code>${escapeHtml(d.hostname)}</code></td></tr>
+    <tr><td>Architecture</td><td>${escapeHtml(d.platform)} / ${escapeHtml(d.arch)}</td></tr>
+    <tr><td>CPU</td><td>${escapeHtml(d.cpu?.model || '—')} · ${d.cpu?.cores || 0} cores</td></tr>
+    <tr><td>Hostname</td><td><code>${escapeHtml(d.hostname || '—')}</code></td></tr>
     <tr><td>LAN IP</td><td><code>${escapeHtml(net.lan_ip || '—')}:${net.port || 3001}</code></td></tr>
     <tr><td>System uptime</td><td>${fmtUptime(sysUp)}</td></tr>
     <tr><td>Process uptime</td><td>${fmtUptime(d.uptime?.process_seconds || 0)}</td></tr>
     <tr><td>Last reading</td><td class="muted small">${fmtTime(d.timestamp)}</td></tr>
   `;
 
-  // Memory breakdown
   $('#mem-table').innerHTML = `
-    <tr><td>Total</td><td>${fmtBytes(d.memory.total_bytes)}</td></tr>
-    <tr><td>Used</td><td>${fmtBytes(d.memory.used_bytes)} (${usedPct.toFixed(1)}%)</td></tr>
-    <tr><td>Available</td><td>${fmtBytes(d.memory.available_bytes || d.memory.free_bytes)}</td></tr>
-    <tr><td>Free</td><td>${fmtBytes(d.memory.free_bytes)}</td></tr>
-    <tr><td>Buffers</td><td>${fmtBytes(d.memory.buffers_bytes || 0)}</td></tr>
-    <tr><td>Cached</td><td>${fmtBytes(d.memory.cached_bytes || 0)}</td></tr>
+    <tr><td>Total</td><td>${fmtBytes(d.memory?.total_bytes)}</td></tr>
+    <tr><td>Used</td><td>${fmtBytes(d.memory?.used_bytes)} (${usedPct.toFixed(1)}%)</td></tr>
+    <tr><td>Available</td><td>${fmtBytes(d.memory?.available_bytes ?? d.memory?.free_bytes)}</td></tr>
+    <tr><td>Free</td><td>${fmtBytes(d.memory?.free_bytes)}</td></tr>
+    <tr><td>Buffers</td><td>${fmtBytes(d.memory?.buffers_bytes || 0)}</td></tr>
+    <tr><td>Cached</td><td>${fmtBytes(d.memory?.cached_bytes || 0)}</td></tr>
   `;
 
-  // Swap breakdown
   $('#swap-table').innerHTML = `
     <tr><td>Total</td><td>${fmtBytes(swap.total_bytes)}</td></tr>
     <tr><td>Used</td><td>${fmtBytes(swap.used_bytes)} (${swapPct.toFixed(1)}%)</td></tr>
     <tr><td>Free</td><td>${fmtBytes(swap.free_bytes)}</td></tr>
   `;
 
-  // Disk breakdown
   $('#disk-table').innerHTML = `
     <tr><td>Total</td><td>${fmtBytes(disk.total_bytes)}</td></tr>
     <tr><td>Used</td><td>${fmtBytes(disk.used_bytes)} (${diskPct}%)</td></tr>
@@ -185,29 +236,29 @@ function renderSystem(d) {
 }
 
 function renderDb(d) {
-  $('#db-version').textContent = d.database ? d.database.version : (d.database_version || '—');
-  $('#db-size').textContent = fmtBytes(d.database ? d.database.size_bytes : d.database_size_bytes);
+  $('#db-version').textContent = d.database?.version || d.database_version || 'PostgreSQL';
+  $('#db-size').textContent = fmtBytes(d.database?.size_bytes ?? d.database_size_bytes);
   const tables = d.tables || [];
   $('#db-tables-count').textContent = tables.length;
 
   $('#db-tables-body').innerHTML = tables.map(t => `
     <tr>
-      <td><code>${t.name}</code></td>
+      <td><code>${escapeHtml(t.name)}</code></td>
       <td class="num">${(t.row_count ?? t.live_tuples ?? 0).toLocaleString()}</td>
       <td class="num">${fmtBytes(t.size_bytes ?? 0)}</td>
     </tr>
-  `).join('') || `<tr><td colspan="3" class="muted">no tables</td></tr>`;
+  `).join('') || `<tr><td colspan="3"><div class="empty-state"><span class="empty-icon">○</span>No user tables yet</div></td></tr>`;
 }
 
 function renderParticipantStats(d) {
-  $('#kpi-participants').textContent = d.total;
+  $('#kpi-participants').textContent = d.total ?? 0;
   $('#kpi-participants-sub').textContent =
-    d.by_team.length ? `${d.by_team.length} team${d.by_team.length > 1 ? 's' : ''}` : 'no teams';
+    d.by_team?.length ? `${d.by_team.length} team${d.by_team.length > 1 ? 's' : ''}` : 'no teams';
 
-  $('#part-total').textContent = d.total;
-  $('#part-teams-count').textContent = d.by_team.length;
+  $('#part-total').textContent = d.total ?? 0;
+  $('#part-teams-count').textContent = d.by_team?.length ?? 0;
 
-  if (d.by_team.length) {
+  if (d.by_team?.length) {
     const top = d.by_team[0];
     $('#part-top-team').textContent = top.team;
     $('#part-top-team-sub').textContent = `${top.count} participant${top.count > 1 ? 's' : ''}`;
@@ -216,9 +267,9 @@ function renderParticipantStats(d) {
     $('#part-top-team-sub').textContent = 'no data';
   }
 
-  $('#team-body').innerHTML = d.by_team.map(t => `
+  $('#team-body').innerHTML = (d.by_team || []).map(t => `
     <tr><td>${escapeHtml(t.team)}</td><td class="num">${t.count}</td></tr>
-  `).join('') || `<tr><td colspan="2" class="muted">no teams</td></tr>`;
+  `).join('') || `<tr><td colspan="2"><div class="empty-state"><span class="empty-icon">○</span>No teams yet</div></td></tr>`;
 
   $('#recent-body').innerHTML = (d.recent_5 || d.recent || []).map(p => `
     <tr>
@@ -226,7 +277,7 @@ function renderParticipantStats(d) {
       <td>${escapeHtml(p.team)}</td>
       <td class="muted small">${fmtRel(p.createdAt)}</td>
     </tr>
-  `).join('') || `<tr><td colspan="3" class="muted">no registrations yet</td></tr>`;
+  `).join('') || `<tr><td colspan="3"><div class="empty-state"><span class="empty-icon">○</span>No registrations yet</div></td></tr>`;
 }
 
 function renderAllParticipants(list) {
@@ -240,7 +291,7 @@ function renderAllParticipants(list) {
       <td class="muted small">${fmtTime(p.createdAt)}</td>
       <td><button class="btn-del" data-id="${p.id}">Delete</button></td>
     </tr>
-  `).join('') : `<tr><td colspan="6" class="muted">no participants</td></tr>`;
+  `).join('') : `<tr><td colspan="6"><div class="empty-state"><span class="empty-icon">○</span>No participants registered yet</div></td></tr>`;
 
   $$('.btn-del').forEach(b => b.addEventListener('click', async (e) => {
     const id = e.target.dataset.id;
@@ -253,8 +304,15 @@ function renderAllParticipants(list) {
   }));
 }
 
+/* Render an error empty-state into a tbody when a section's fetch fails */
+function renderError(tbodyId, cols, msg) {
+  const el = document.getElementById(tbodyId);
+  if (!el) return;
+  el.innerHTML = `<tr><td colspan="${cols}"><div class="empty-state err"><span class="empty-icon">⚠</span>${escapeHtml(msg)}</div></td></tr>`;
+}
+
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
 }
@@ -262,41 +320,55 @@ function escapeHtml(s) {
 // ─── Main refresh ──────────────────────────────────────────────────────────
 async function refresh() {
   const t0 = Date.now();
-  setStatus(true, 'refreshing…');
+  setStatus('connecting', 'Refreshing…');
+  $('#btn-refresh').classList.add('refreshing');
 
-  /* Render each section as soon as its data arrives — don't block on the
-   * slowest call. A slow /participants must not delay /health rendering. */
+  /* Each section renders as soon as its data arrives. A slow /participants
+   * must not delay /health rendering. */
   const sections = [
-    {path: '/health/detailed',   render: renderHealth},
-    {path: '/system',            render: renderSystem},
-    {path: '/stats/database',    render: renderDb},
-    {path: '/stats/participants', render: renderParticipantStats},
-    {path: '/participants?limit=200', render: renderAllParticipants},
+    {path: '/health/detailed',        render: renderHealth,           errorTarget: ['health-table', 3]},
+    {path: '/system',                 render: renderSystem,           errorTarget: ['host-table', 2]},
+    {path: '/stats/database',         render: renderDb,               errorTarget: ['db-tables-body', 3]},
+    {path: '/stats/participants',     render: renderParticipantStats, errorTarget: ['team-body', 2]},
+    {path: '/participants?limit=200', render: renderAllParticipants,  errorTarget: ['all-body', 6]},
   ];
 
   const results = await Promise.allSettled(
     sections.map(s => fetchJson(s.path).then(d => ({s, d})))
   );
 
-  let okCount = 0;
-  for (const r of results) {
+  let okCount = 0, errCount = 0;
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    const s = sections[i];
     if (r.status === 'fulfilled') {
-      try { r.value.s.render(r.value.d); okCount++; }
-      catch (e) { console.error('render', r.value.s.path, e); }
+      try { s.render(r.value.d); okCount++; }
+      catch (e) {
+        console.error('render', s.path, e);
+        errCount++;
+        renderError(s.errorTarget[0], s.errorTarget[1], 'Render error: ' + e.message);
+      }
     } else {
-      console.error('fetch', r.reason);
+      console.error('fetch', s.path, r.reason);
+      errCount++;
+      renderError(s.errorTarget[0], s.errorTarget[1],
+        'Failed to load (' + (r.reason?.message || 'network error') + ')');
     }
   }
 
   const elapsed = Date.now() - t0;
+  $('#btn-refresh').classList.remove('refreshing');
+
   if (okCount === sections.length) {
-    setStatus(true, `online · ${elapsed}ms`);
+    setStatus('ok', `Connected · ${elapsed}ms`);
+    lastSuccessfulRefresh = new Date().toISOString();
+    tickLastUpdate();
   } else if (okCount > 0) {
-    setStatus(true, `partial · ${okCount}/${sections.length}`);
+    setStatus('warn', `Partial · ${okCount}/${sections.length}`);
   } else {
-    setStatus(false, 'offline');
+    setStatus('error', 'Offline');
+    $('#last-update').textContent = 'Failed to refresh';
   }
-  $('#last-update').textContent = `Updated ${new Date().toLocaleTimeString(undefined, { hour12: false })}`;
 }
 
 $('#btn-refresh').addEventListener('click', refresh);
