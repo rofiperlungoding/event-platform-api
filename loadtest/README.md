@@ -1,110 +1,106 @@
 # Load Testing
 
-Synthetic load test harness for the Event Platform API. Validates the
-primary project goal: **2,000 attendees checking in simultaneously with
-zero errors**.
+Reference workload for the platform's primary capacity goal:
+**2,000 attendees checking in simultaneously, zero errors**.
 
-## Test Scripts
+## Files
 
-| Script | Purpose |
-|--------|---------|
-| `run-stampede.js` | Primary 2,000-concurrent stampede against `/attendance/quick-checkin`. Self-contained: seeds participants + devices, creates a session, fires the parallel burst, prints percentiles, and cleans up. |
-| `stress.js` | Legacy stress harness against `/attendance/checkin` (auth-token based). Retained for the historical comparison documented below. |
-| `setup-session.js` | Helper that logs in as admin, ensures an event exists, and creates a fresh attendance session. Prints the session code on stdout. |
-| `seed.sql` | Direct SQL seeder for batch participant + device creation when API access is unavailable. |
-| `latency-probe.sh` | Measures sequential and concurrent latency on the tablet itself for performance regression detection. |
+| File                  | Purpose                                                                          |
+| --------------------- | -------------------------------------------------------------------------------- |
+| `run-stampede.js`     | One-shot orchestrator: seeds participants and devices, creates a session, fires the parallel burst, prints percentiles, cleans up. |
+| `latency-probe.sh`    | Single-request and 100-concurrent baseline latency probe (run on the tablet).    |
+| `ws-test.js`          | WebSocket live-feed connectivity check.                                          |
+| `package.json`        | One dependency (`undici` for the high-concurrency dispatcher) and `ws`.          |
 
-## Reference Result (LAN)
+## Quick Start
 
-The reference workload — 2,000 concurrent check-ins fired from a laptop
-on the same Wi-Fi — completes consistently in approximately two seconds
-with no failures.
+From a laptop on the same Wi-Fi as the tablet:
+
+```bash
+cd loadtest
+npm install
+node run-stampede.js 2000 http://<tablet-lan-ip>:3001
+```
+
+Default admin credentials are picked up from `ADMIN_EMAIL` and
+`ADMIN_PASSWORD` (defaults match the reference deployment).
+
+## Reference Result
 
 ```
-� Orchestrated stampede: 2000 concurrent
+💥 Orchestrated stampede: 2000 concurrent
 
    API:    http://192.168.100.67:3001
    Run id: rmpgvv983
 
   ✓ admin logged in
   ✓ seeded 2000 participants, 2000 devices in 0.235s
-  ✓ id range: 14175..16174
   ✓ session 8pJcSq3z
 
 ━━━ STAMPEDE: firing 2000 parallel /attendance/quick-checkin ━━━
-  ✓ all settled in 2021ms
+  ✓ all settled in 1841ms
 
 ━━━ RESULTS ━━━
   Total:        2000
   Successful:   2000  (100.0%)
   Errors:       0
-  Throughput:   990 req/s
-  Latency ms:   min=101 avg=327 p50=222 p95=1040 p99=1060 max=1179
+  Throughput:   1086 req/s
+  Latency ms:   min=122 avg=404 p50=382 p95=987 p99=1355 max=1367
+  Attempts:     1x:2000
 
   ✅ PASS: 100.00% accepted
 ```
 
-## Architecture That Makes This Possible
+## Methodology
 
-Three changes converted the original ~50% pass rate into a 100% pass
-rate at 2,000 concurrent:
+`run-stampede.js` runs five phases:
 
-1. **`/attendance/quick-checkin` endpoint.** Resolves device UUID,
-   session code, and attendance insertion as a single SQL CTE, removing
-   one round-trip per request and bypassing the JWT verify path. The
-   PWA uses this endpoint exclusively after the device has been linked
-   once.
-2. **Pre-fork worker pool.** The C server forks 8 workers (matching
-   the 8-core Unisoc T618) which share the listening socket. The
-   kernel load-balances `accept()` across them. The supervisor process
-   restarts dead workers automatically.
-3. **Per-worker persistent libpq connection.** Each worker keeps one
-   `PGconn` open across requests. This eliminates the
-   ~50 ms TCP/handshake cost on the hot path; concurrent end-to-end
-   latency drops from ~75 ms to ~10 ms.
+1. **Authenticate** as administrator via `POST /auth/login`.
+2. **Seed N participants and devices** in a single SQL transaction via
+   `POST /participants/seed-stamp`. The endpoint is admin-only and
+   exists exclusively for this harness.
+3. **Create a fresh attendance session** via `POST /sessions/create`.
+4. **Stampede.** Fire N parallel `POST /attendance/quick-checkin`
+   requests. Concurrency is gated to 500 in flight to avoid local file
+   descriptor exhaustion. Each request retries with jittered
+   exponential backoff up to five times. Retries are safe because the
+   server enforces `UNIQUE(participant_id, session_id)` — duplicate
+   inserts collapse to `409 Conflict` and are counted as success.
+5. **Cleanup** via `POST /participants/seed-cleanup`.
 
-## Usage — Quick Stampede
+The harness uses Node's built-in `fetch` with an `undici` dispatcher
+configured for 2,000 concurrent connections so that client-side socket
+exhaustion does not mask server behaviour.
 
-```bash
-# Targeted run — admin credentials picked up from env or default
-node run-stampede.js 2000 http://192.168.100.67:3001
-```
+## Architecture That Makes 2,000 Possible
 
-The script orchestrates the whole flow:
+| Layer            | Optimisation                                  | Effect                                      |
+| ---------------- | --------------------------------------------- | ------------------------------------------- |
+| Process model    | Pre-fork pool of 8 workers                    | Saturates all 8 cores; removes spawn cost   |
+| DB layer         | Per-worker persistent libpq connection        | Eliminates ~50 ms TCP handshake per request |
+| Application code | Single-CTE quick-checkin                      | One DB round trip resolves device, session, attendance |
+| Client behaviour | PWA prefers LAN; tunnel is fallback only      | Bypasses Cloudflare free-tier ingress cap   |
+| Resilience       | Idempotent retry + offline IndexedDB queue    | Transient failures recover transparently    |
 
-1. Logs in as admin (single auth call, no rate limit pressure).
-2. Calls `POST /participants/seed-stamp` to bulk-create N participants
-   and pre-link N devices in a single SQL transaction.
-3. Calls `POST /sessions/create` for a fresh attendance session.
-4. Fires N parallel `POST /attendance/quick-checkin` requests, batching
-   into rolling flights of 500 to avoid local FD exhaustion.
-5. Prints the success rate, throughput, and latency percentiles.
-6. Calls `POST /participants/seed-cleanup` to remove the synthetic data.
+Detailed in [`docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md).
 
-## Bottleneck Analysis
+## Capacity by Path
 
-| Path | Throughput | Pass rate at N=2,000 | Note |
-|------|-----------|---------------------|------|
-| Direct LAN | ~990 req/s | 100 % | Reference target |
-| Cloudflare Tunnel (free tier) | ~45 req/s | ~57 % | Tunnel per-account concurrency cap |
-| Direct LAN (older single-thread server) | ~140 req/s | partial | Pre-fork pool change required |
+| Path                                | N    | Pass    | Throughput   | Notes                                                 |
+| ----------------------------------- | ---- | ------- | ------------ | ----------------------------------------------------- |
+| Direct LAN                          | 2000 | 100.00% | ~1,086 req/s | Reference target                                      |
+| Direct LAN (single-thread baseline) | 500  | partial | ~140 req/s   | Pre-pool collapse point                               |
+| Cloudflare Tunnel free tier         | 2000 | ~60%    | ~21 req/s    | Account-level concurrent connection cap; not a server limit |
 
-The Cloudflare Tunnel free tier caps concurrent connections per account
-at a level well below the burst envelope of a 2,000-attendee event. Two
-options exist for events that want to use the tunnel:
+For events where some attendees are off-network, the PWA queues
+locally and drains via `POST /attendance/batch-checkin` once
+connectivity returns. This converts a burst into a sustained
+~50 req/s, which the free-tier tunnel handles comfortably.
 
-- The PWA enqueues check-ins offline-first; the queue drains via
-  `POST /attendance/batch-checkin` when the tunnel has spare capacity.
-  This converts the burst into a sustained ~50 req/s rate which the
-  free tunnel handles comfortably.
-- Subscribe to the Cloudflare Tunnel paid tier or front the tablet
-  with a self-hosted reverse proxy such as Nginx; see
-  `docs/REVERSE_PROXY.md`.
+## Manual Cleanup
 
-## Cleanup
-
-`run-stampede.js` cleans up synthetic data automatically. For manual
-cleanup of seeds left behind by interrupted runs:
+`run-stampede.js` cleans up after a successful run. For interrupted
+runs, drop synthetic data manually:
 
 ```sql
 DELETE FROM "Attendance" WHERE participant_id IN (
