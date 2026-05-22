@@ -160,6 +160,11 @@ detailed documentation of each script.
 
 Synthetic load testing harness. See [`loadtest/README.md`](loadtest/README.md).
 
+### `tui/`
+
+Terminal-based admin dashboard built with ncurses. See
+[`tui/README.md`](tui/README.md).
+
 ### `.github/workflows/ci.yml`
 
 GitHub Actions workflow that compiles `server.c` on every push and validates
@@ -262,6 +267,7 @@ All endpoints accept and return JSON, with permissive CORS headers
 | GET    | `/attendance/session/:id`      | Bearer | List check-ins for a session.          |
 | GET    | `/attendance/session/:id/export` | Admin | Download attendance as CSV.            |
 | GET    | `/attendance/me`               | Bearer | Authenticated user's attendance log.   |
+| GET    | `/ws/attendance/:id?token=...` | Admin  | WebSocket: live check-in feed.         |
 
 ### Device Identity
 
@@ -313,6 +319,12 @@ procedure, including:
 - Cloudflare Tunnel registration and DNS configuration
 - pm2 setup
 - Boot script installation
+
+### Alternative: Nginx Reverse Proxy
+
+For deployments on hosts with a static public IP (VPS, dedicated
+server), see [`docs/REVERSE_PROXY.md`](docs/REVERSE_PROXY.md) for an
+Nginx-based topology that replaces Cloudflare Tunnel.
 
 ### Continuous Deployment
 
@@ -384,12 +396,14 @@ curl 'https://console.example.com/full-status.json'
 event-platform-api/
 ├── server.c                      # Main application source (single file)
 ├── migrations/
-│   └── 002_auth_attendance.sql   # Database schema
+│   ├── 002_auth_attendance.sql
+│   ├── 003_named_sessions.sql
+│   └── 004_multi_event.sql
 ├── deploy/
 │   ├── README.md                 # Operational scripts documentation
 │   ├── deploy-api.sh             # Auto-deploy with smoke test
 │   ├── rollback.sh               # Restore previous binary
-│   ├── health-watchdog.sh        # 5-min cron: detect + recover
+│   ├── health-watchdog.sh        # 5-min cron: detect + recover + alert
 │   ├── db-backup.sh              # Daily pg_dump
 │   ├── setup-cron.sh             # Install all cron jobs
 │   ├── boot-script.sh            # Termux:Boot autostart
@@ -399,10 +413,15 @@ event-platform-api/
 ├── loadtest/
 │   ├── README.md
 │   └── stress.js                 # Concurrent request generator
+├── tui/
+│   ├── README.md
+│   ├── Makefile
+│   └── admin-tui.c               # ncurses operational dashboard
 ├── docs/
 │   ├── INSTALL.md                # Initial bootstrap procedure
 │   ├── ARCHITECTURE.md           # Detailed design rationale
-│   └── API.md                    # Complete API reference
+│   ├── API.md                    # Complete API reference
+│   └── REVERSE_PROXY.md          # Nginx alternative deployment
 ├── .github/
 │   └── workflows/ci.yml          # Compile + lint validation
 ├── .gitignore

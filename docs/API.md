@@ -433,6 +433,45 @@ id,name,email,team,device_id,checked_in_at
 89,"Jane Doe","jane@example.com","Engineering","dev-abc","2026-05-22 08:05:23"
 ```
 
+### `GET /ws/attendance/:id?token=<token>`
+
+WebSocket endpoint for streaming live check-in events. **Administrator
+access required.** The token is passed as a query parameter because
+browser WebSocket clients cannot supply arbitrary headers.
+
+**Upgrade Handshake**
+
+Standard RFC 6455 handshake. Server responds `101 Switching Protocols`
+with `Sec-WebSocket-Accept` header.
+
+**Server Frames**
+
+The server pushes JSON-encoded text frames for three event types:
+
+```json
+{ "event": "connected",  "session_id": 12, "timestamp": "1779543600" }
+{ "event": "checkin",    "id": 89, "participant_id": 5,
+  "name": "Jane Doe", "email": "jane@example.com", "team": "Engineering",
+  "device_id": "dev-abc", "checkedInAt": "2026-05-22 08:05:23.123" }
+{ "event": "heartbeat" }
+```
+
+- `connected` is sent immediately after the handshake.
+- `checkin` is sent each time a new attendance row is inserted.
+- `heartbeat` is sent every 30 seconds when no other traffic occurs,
+  allowing clients to detect dead connections.
+
+**Client Behaviour**
+
+The reference admin frontend (`/attend/admin.html`) opens the WebSocket
+when a session is started and replaces what was previously a 2-second
+polling loop. On disconnect, the client auto-reconnects after 3 seconds.
+
+**Connection Lifetime**
+
+The server closes the connection after 600 seconds of idle time
+(no new check-ins). Clients should reconnect on close.
+
 ---
 
 ## Bulk Operations (Administrator Only)
