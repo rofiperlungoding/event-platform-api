@@ -75,22 +75,59 @@ console.log(`   Run id: ${RUN_ID}\n`);
   const start = Date.now();
   const results = new Array(deviceUuids.length);
   const FLIGHT = 500;     // max concurrent in-flight fetches per batch
-  const BATCH_DELAY_MS = 0;
+
+  /* Per-request settings: short timeout so a stuck connection retries
+   * fast instead of holding a socket for 30s. */
+  const PER_TRY_TIMEOUT_MS = 6000;
+  const MAX_TRIES = 5;
+
+  /* Smart-retry single check-in: short timeout, jittered exponential
+   * backoff. A single device's check-in is idempotent server-side
+   * (UNIQUE constraint on participant_id+session_id), so retries can
+   * never cause duplicate attendance — they either succeed, return 409
+   * (already checked in, treat as success), or surface a real error. */
+  const checkinOne = async (duuid, idx) => {
+    const t0 = Date.now();
+    let lastBody = '';
+    let lastStatus = 0;
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), PER_TRY_TIMEOUT_MS);
+      try {
+        const r = await fetch(`${API}/attendance/quick-checkin`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({session_code: sessionCode, device_uuid: duuid}),
+          signal: ctl.signal,
+        });
+        clearTimeout(timer);
+        if (r.ok || r.status === 409) {
+          results[idx] = {ok: r.ok, status: r.status, latency: Date.now() - t0,
+                          body: null, attempts: attempt};
+          return;
+        }
+        lastStatus = r.status;
+        lastBody = await r.text().catch(() => '');
+        /* 4xx other than 409 are deterministic — no point retrying */
+        if (r.status >= 400 && r.status < 500 && r.status !== 408) break;
+      } catch (e) {
+        clearTimeout(timer);
+        lastBody = e.message || 'fetch failed';
+      }
+      /* Jittered backoff: 50, 100, 200, 400 ms ± 30 % */
+      const base = 50 * Math.pow(2, attempt - 1);
+      const delay = base + Math.floor(Math.random() * base * 0.6);
+      await new Promise(r => setTimeout(r, delay));
+    }
+    results[idx] = {ok: false, status: lastStatus, latency: Date.now() - t0,
+                    body: lastBody, attempts: MAX_TRIES};
+  };
 
   let nextIdx = 0;
   let active = 0;
   const fireOne = idx => {
-    const t = Date.now();
     active++;
-    return fetch(`${API}/attendance/quick-checkin`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({session_code: sessionCode, device_uuid: deviceUuids[idx]}),
-    })
-      .then(async r => ({ok: r.ok, status: r.status, latency: Date.now() - t,
-                          body: r.ok ? null : await r.text().catch(() => '')}))
-      .catch(e => ({ok: false, status: 0, latency: Date.now() - t, body: e.message}))
-      .then(r => { results[idx] = r; active--; return r; });
+    return checkinOne(deviceUuids[idx], idx).finally(() => { active--; });
   };
 
   /* Kick off the first FLIGHT, then keep topping up. */
@@ -131,6 +168,14 @@ console.log(`   Run id: ${RUN_ID}\n`);
   console.log(`  Errors:       ${errors.length}`);
   console.log(`  Throughput:   ${(results.length / (totalMs / 1000)).toFixed(0)} req/s`);
   console.log(`  Latency ms:   min=${lats[0]} avg=${avg.toFixed(0)} p50=${pct(50)} p95=${pct(95)} p99=${pct(99)} max=${lats[lats.length - 1]}`);
+
+  /* Retry distribution (idempotent retries are how we hit 100 %) */
+  const byAttempt = {};
+  for (const r of results) {
+    const a = r.attempts || 1;
+    byAttempt[a] = (byAttempt[a] || 0) + 1;
+  }
+  console.log(`  Attempts:     ` + Object.entries(byAttempt).sort().map(([k, v]) => `${k}x:${v}`).join('  '));
   if (errors.length) {
     console.log('  Errors:');
     for (const [k, v] of Object.entries(errBy)) console.log(`    ${v}x  ${k}`);
