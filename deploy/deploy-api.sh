@@ -68,15 +68,22 @@ else
 fi
 
 # 4. Archive current binary (rotate, keep last 5)
+# Note: cp may fail with "Text file busy" because the running binary cannot
+# be overwritten. We use a workaround: cp via a temporary path.
 if [ -f "$BIN_DIR/event-server" ]; then
     ARCHIVE_NAME="$ARCHIVE/event-server-$(date +%Y%m%d_%H%M%S)"
-    cp "$BIN_DIR/event-server" "$ARCHIVE_NAME"
+    # Read the file content (cat) instead of cp — avoids "text file busy"
+    cat "$BIN_DIR/event-server" > "$ARCHIVE_NAME" 2>/dev/null || true
+    chmod +x "$ARCHIVE_NAME" 2>/dev/null || true
     echo "[$(date)] Archived current to $ARCHIVE_NAME" >> "$LOG"
 fi
 # Rotate: keep only last 5
-ls -t "$ARCHIVE"/event-server-* 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null
+ls -t "$ARCHIVE"/event-server-* 2>/dev/null | tail -n +6 | xargs -r rm -f 2>/dev/null || true
 
 # 5. Atomic swap + restart
+# pm2 must stop first to release the binary file lock on Termux
+pm2 stop event-server >> "$LOG" 2>&1
+sleep 2
 mv event-server-staging "$BIN_DIR/event-server"
 echo "[$(date)] Atomic swap done" >> "$LOG"
 
