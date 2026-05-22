@@ -43,7 +43,8 @@ input{width:100%;padding:10px 12px;margin-bottom:10px;background:#0f1419;border:
 .history-item .text{font-family:var(--mono);color:var(--muted)}
 .offline-badge{position:fixed;top:8px;right:8px;background:var(--red);color:#fff;font-size:11px;padding:4px 8px;border-radius:4px;font-family:var(--mono);display:none}
 .offline-badge.show{display:block}
-.queue-count{font-family:var(--mono);color:var(--accent);font-size:12px}
+.queue-count{font-family:var(--mono);color:var(--accent);font-size:12px;transition:color .2s}
+.queue-count.stale{color:var(--red);font-weight:700}
 </style>
 </head>
 <body>
@@ -175,7 +176,7 @@ async function processQueue() {
     (bySession[code] = bySession[code] || []).push(it);
   }
 
-  let synced = 0;
+  let synced = 0, dropped = 0;
   for (const [code, group] of Object.entries(bySession)) {
     try {
       const r = await fetch(`${API}/attendance/batch-checkin`, {
@@ -186,6 +187,16 @@ async function processQueue() {
           items: group.map(g => ({device_uuid: g.device_uuid || deviceId})),
         }),
       });
+      if (r.status === 404) {
+        /* Session is gone (expired or restarted). The queued items can
+         * never succeed, so drop them so the queue does not grow
+         * indefinitely. The user has already seen "Queued" feedback. */
+        const dtx = db.transaction('queue', 'readwrite');
+        const dst = dtx.objectStore('queue');
+        for (const g of group) dst.delete(g.id);
+        dropped += group.length;
+        continue;
+      }
       if (!r.ok) continue;
       const d = await r.json();
       /* All attempted rows are now resolved server-side (accepted OR duplicate
@@ -201,14 +212,38 @@ async function processQueue() {
 
   if (synced > 0) {
     showStatus(`✓ Synced ${synced} check-in${synced > 1 ? 's' : ''}`, 'success');
-    updateQueueCount();
   }
+  if (dropped > 0) {
+    showStatus(`⚠ Dropped ${dropped} stale check-in${dropped > 1 ? 's' : ''} (session expired)`, 'error');
+  }
+  updateQueueCount();
 }
 
 async function updateQueueCount() {
   const n = await getQueueCount();
-  document.getElementById('queue-count').textContent = n > 0 ? `${n} pending sync` : '';
+  const el = document.getElementById('queue-count');
+  if (n === 0) { el.textContent = ''; el.className = 'queue-count'; return; }
+  /* Find the oldest pending item to show staleness */
+  const db = await openDB();
+  const items = await new Promise(r => {
+    const req = db.transaction('queue', 'readonly').objectStore('queue').getAll();
+    req.onsuccess = () => r(req.result);
+  });
+  const oldest = items.length ? Math.min(...items.map(i => i.timestamp || Date.now())) : Date.now();
+  const ageSec = Math.floor((Date.now() - oldest) / 1000);
+  const ageStr = ageSec < 60 ? `${ageSec}s` : ageSec < 3600 ? `${Math.floor(ageSec/60)}m` : `${Math.floor(ageSec/3600)}h`;
+  el.textContent = `${n} pending · oldest ${ageStr}`;
+  /* Highlight if anything is stuck > 60 s */
+  el.className = 'queue-count' + (ageSec > 60 ? ' stale' : '');
 }
+
+/* Opportunistic drain — fires every 15 s regardless of online events.
+ * Catches network flaps that don't trigger window.online (very common on
+ * unstable wifi or carrier handoff). */
+let drainInterval = setInterval(async () => {
+  const n = await getQueueCount();
+  if (n > 0 && navigator.onLine) processQueue();
+}, 15000);
 
 // ─── Online/Offline detection ───────────────────────────────────────────
 window.addEventListener('online', () => {
