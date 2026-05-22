@@ -46,8 +46,8 @@
   --shadow-sm: 0 1px 1px rgba(0, 28, 36, 0.05);
   --shadow:    0 1px 3px rgba(0, 28, 36, 0.08);
   --radius: 4px;
-  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", monospace;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -59,6 +59,9 @@ body {
   background: var(--surface-bg);
   display: flex;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "cv11", "ss01", "ss03";   /* Inter — disambiguated 1, l, I */
+  letter-spacing: -0.005em;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -362,6 +365,7 @@ body {
   margin-top: 6px;
   line-height: 1.15;
   letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
 }
 .stat-value.small { font-size: 15px; font-weight: 600; }
 .stat-value .unit {
@@ -417,8 +421,8 @@ table { width: 100%; border-collapse: collapse; }
 }
 .data-table tbody tr:hover { background: var(--surface-card-head); }
 .data-table tbody tr:last-child td { border-bottom: none; }
-.data-table .num { text-align: right; font-family: var(--mono); }
-.data-table td.num { font-family: var(--mono); }
+.data-table .num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.data-table td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
 .muted { color: var(--text-soft); }
 .small { font-size: 11px; }
