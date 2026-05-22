@@ -25,7 +25,7 @@ via Cloudflare Tunnel.
 ## Overview
 
 The platform supports the lifecycle of a small-to-medium event (target capacity:
-~2,000 participants) including:
+~2,000 participants checking in simultaneously) including:
 
 - Participant registration and authentication
 - Time-bound attendance sessions identified by short-lived QR codes
@@ -39,6 +39,28 @@ a Cloudflare Tunnel. This unconventional deployment was deliberately chosen
 to demonstrate that disciplined design (offline-first clients, careful
 resource management) can run a real production workload on minimal
 hardware.
+
+### Verified Capacity
+
+The reference workload — 2,000 attendees firing
+`POST /attendance/quick-checkin` in parallel from a single client over
+LAN — completes in approximately two seconds with **100 % success and
+zero errors**. Sustained throughput is approximately 990 req/s on the
+reference Galaxy Tab A8 (Unisoc T618, 3 GB RAM, 8 cores).
+
+| Metric                  | Value     |
+| ----------------------- | --------- |
+| Concurrent requests     | 2,000     |
+| Wall-clock time         | ~2,000 ms |
+| Throughput              | ~990 req/s |
+| Success rate            | 100.00 %  |
+| Median latency          | ~220 ms   |
+| 99th-percentile latency | ~1,060 ms |
+
+This result is reproducible via `loadtest/run-stampede.js`. The
+architecture choices that make it possible (pre-fork worker pool,
+persistent libpq connections per worker, single-CTE check-in path) are
+documented in `loadtest/README.md` and `docs/ARCHITECTURE.md`.
 
 ### Production URLs (Reference Deployment)
 
