@@ -653,11 +653,28 @@ static void handle_stats_participants(int fd) {
     send_json(fd, 200, "OK", buf);
 }
 
-static void handle_participants_list(int fd) {
+static void handle_participants_list(int fd, const char *path) {
     PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
-    PGresult *r = PQexec(conn, "SELECT id, name, email, team, \"createdAt\", \"updatedAt\" FROM \"Participant\" ORDER BY \"createdAt\" DESC");
+    /* Cap limit to keep dashboard responsive. Default 500, max 5000. */
+    int limit = 500;
+    const char *q = strchr(path, '?');
+    if (q) {
+        const char *l = strstr(q, "limit=");
+        if (l) {
+            int v = atoi(l + 6);
+            if (v > 0) limit = v > 5000 ? 5000 : v;
+        }
+    }
+
+    char limit_str[16];
+    snprintf(limit_str, sizeof(limit_str), "%d", limit);
+    const char *params[1] = { limit_str };
+    PGresult *r = PQexecParams(conn,
+        "SELECT id, name, email, team, \"createdAt\", \"updatedAt\" "
+        "FROM \"Participant\" ORDER BY \"createdAt\" DESC LIMIT $1::int",
+        1, NULL, params, NULL, NULL, 0);
     strbuf sb; sb_init(&sb, 4096);
     sb_append(&sb, "[");
     if (PQresultStatus(r) == PGRES_TUPLES_OK) {
@@ -2263,7 +2280,10 @@ static void handle_request(int fd, const char *method, const char *path,
         if (strcmp(path, "/stats/database") == 0) { handle_stats_database(fd); return; }
         if (strcmp(path, "/stats/participants") == 0) { handle_stats_participants(fd); return; }
         if (strcmp(path, "/events") == 0) { handle_events_list(fd); return; }
-        if (strcmp(path, "/participants") == 0) { handle_participants_list(fd); return; }
+        if (strcmp(path, "/participants") == 0 ||
+            (strncmp(path, "/participants?", 14) == 0)) {
+            handle_participants_list(fd, path); return;
+        }
         if (strncmp(path, "/participants/", 14) == 0) {
             handle_participant_get(fd, path + 14);
             return;

@@ -262,26 +262,41 @@ function escapeHtml(s) {
 // ─── Main refresh ──────────────────────────────────────────────────────────
 async function refresh() {
   const t0 = Date.now();
-  try {
-    const [health, sys, dbStats, partStats, partList] = await Promise.all([
-      fetchJson('/health/detailed'),
-      fetchJson('/system'),
-      fetchJson('/stats/database'),
-      fetchJson('/stats/participants'),
-      fetchJson('/participants'),
-    ]);
-    renderHealth(health);
-    renderSystem(sys);
-    renderDb(dbStats);
-    renderParticipantStats(partStats);
-    renderAllParticipants(partList);
-    setStatus(true, `online · ${Date.now() - t0}ms`);
-    $('#last-update').textContent = `Updated ${new Date().toLocaleTimeString(undefined, { hour12: false })}`;
-  } catch (err) {
-    setStatus(false, 'offline');
-    $('#last-update').textContent = `Error: ${err.message}`;
-    console.error(err);
+  setStatus(true, 'refreshing…');
+
+  /* Render each section as soon as its data arrives — don't block on the
+   * slowest call. A slow /participants must not delay /health rendering. */
+  const sections = [
+    {path: '/health/detailed',   render: renderHealth},
+    {path: '/system',            render: renderSystem},
+    {path: '/stats/database',    render: renderDb},
+    {path: '/stats/participants', render: renderParticipantStats},
+    {path: '/participants?limit=200', render: renderAllParticipants},
+  ];
+
+  const results = await Promise.allSettled(
+    sections.map(s => fetchJson(s.path).then(d => ({s, d})))
+  );
+
+  let okCount = 0;
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      try { r.value.s.render(r.value.d); okCount++; }
+      catch (e) { console.error('render', r.value.s.path, e); }
+    } else {
+      console.error('fetch', r.reason);
+    }
   }
+
+  const elapsed = Date.now() - t0;
+  if (okCount === sections.length) {
+    setStatus(true, `online · ${elapsed}ms`);
+  } else if (okCount > 0) {
+    setStatus(true, `partial · ${okCount}/${sections.length}`);
+  } else {
+    setStatus(false, 'offline');
+  }
+  $('#last-update').textContent = `Updated ${new Date().toLocaleTimeString(undefined, { hour12: false })}`;
 }
 
 $('#btn-refresh').addEventListener('click', refresh);
