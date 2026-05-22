@@ -441,43 +441,142 @@ static void handle_health_detailed(int fd) {
     send_json(fd, 200, "OK", buf);
 }
 
+/* Helper: run a shell command and capture first N bytes of stdout. */
+static int run_capture(const char *cmd, char *out, int sz) {
+    FILE *p = popen(cmd, "r");
+    if (!p) { out[0] = 0; return -1; }
+    int n = fread(out, 1, sz - 1, p);
+    out[n > 0 ? n : 0] = 0;
+    /* Trim trailing whitespace */
+    while (n > 0 && (out[n-1] == '\n' || out[n-1] == '\r' || out[n-1] == ' ' || out[n-1] == '\t')) {
+        out[--n] = 0;
+    }
+    pclose(p);
+    return n;
+}
+
 static void handle_system(int fd) {
-    char buf[1024];
+    /* Memory — /proc/meminfo IS readable on Termux */
     long total = 0, free_mem = 0, avail = 0, buffers = 0, cached = 0;
+    long swap_total = 0, swap_free = 0;
     FILE *f = fopen("/proc/meminfo", "r");
     if (f) {
         char line[256];
         while (fgets(line, sizeof(line), f)) {
-            if (sscanf(line, "MemTotal: %ld kB", &total) == 1) total *= 1024;
+            if      (sscanf(line, "MemTotal: %ld kB", &total) == 1) total *= 1024;
             else if (sscanf(line, "MemFree: %ld kB", &free_mem) == 1) free_mem *= 1024;
             else if (sscanf(line, "MemAvailable: %ld kB", &avail) == 1) avail *= 1024;
             else if (sscanf(line, "Buffers: %ld kB", &buffers) == 1) buffers *= 1024;
             else if (sscanf(line, "Cached: %ld kB", &cached) == 1) cached *= 1024;
+            else if (sscanf(line, "SwapTotal: %ld kB", &swap_total) == 1) swap_total *= 1024;
+            else if (sscanf(line, "SwapFree: %ld kB", &swap_free) == 1) swap_free *= 1024;
         }
         fclose(f);
     }
     long used = total - free_mem - buffers - cached;
     double used_pct = total > 0 ? (double)used / total * 100.0 : 0;
+    long swap_used = swap_total - swap_free;
+    double swap_pct = swap_total > 0 ? (double)swap_used / swap_total * 100.0 : 0;
 
+    /* Load average — `uptime` shell command is the only working source on
+     * Termux because /proc/loadavg is permission-denied on Android. */
     double l1 = 0, l5 = 0, l15 = 0;
-    f = fopen("/proc/loadavg", "r");
-    if (f) { fscanf(f, "%lf %lf %lf", &l1, &l5, &l15); fclose(f); }
+    long sys_uptime_sec = 0;
+    char up_buf[256];
+    if (run_capture("uptime 2>/dev/null", up_buf, sizeof(up_buf)) > 0) {
+        char *la = strstr(up_buf, "load average:");
+        if (la) sscanf(la, "load average: %lf, %lf, %lf", &l1, &l5, &l15);
+        /* Parse "up 14 days, 10:31" */
+        char *up = strstr(up_buf, " up ");
+        if (up) {
+            int days = 0, hours = 0, mins = 0;
+            if (sscanf(up + 4, "%d days, %d:%d", &days, &hours, &mins) >= 1 ||
+                sscanf(up + 4, "%d:%d", &hours, &mins) >= 1) {
+                sys_uptime_sec = (long)days * 86400 + hours * 3600 + mins * 60;
+            }
+        }
+    }
 
+    /* Disk usage of $HOME — use df with default 1K blocks (busybox df
+     * does not support -B). Values are multiplied to bytes. */
+    long disk_total = 0, disk_used = 0, disk_free = 0;
+    int disk_pct = 0;
+    char df_buf[512];
+    if (run_capture("df \"$HOME\" 2>/dev/null | tail -1", df_buf, sizeof(df_buf)) > 0) {
+        char fsname[128];
+        long t = 0, u = 0, fr = 0;
+        if (sscanf(df_buf, "%127s %ld %ld %ld %d", fsname, &t, &u, &fr, &disk_pct) >= 5) {
+            disk_total = t * 1024;
+            disk_used  = u * 1024;
+            disk_free  = fr * 1024;
+        }
+    }
+
+    /* Device model + Android version — getprop is freely accessible */
+    char device_model[64] = "unknown", android_ver[16] = "?", brand[32] = "";
+    run_capture("getprop ro.product.model 2>/dev/null", device_model, sizeof(device_model));
+    run_capture("getprop ro.product.brand 2>/dev/null", brand, sizeof(brand));
+    run_capture("getprop ro.build.version.release 2>/dev/null", android_ver, sizeof(android_ver));
+
+    /* Hostname (always "localhost" on Termux but harmless) */
+    char hostname[64] = "tablet";
+    if (gethostname(hostname, sizeof(hostname)) != 0) strcpy(hostname, "tablet");
+
+    /* LAN IP — read from peer of an ephemeral UDP socket. We don't actually
+     * send anything; getsockname after connect() reveals the source IP the
+     * kernel would use to reach the destination. */
+    char lan_ip[32] = "0.0.0.0";
+    int probe = socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe >= 0) {
+        struct sockaddr_in target;
+        memset(&target, 0, sizeof(target));
+        target.sin_family = AF_INET;
+        target.sin_port = htons(53);
+        inet_aton("1.1.1.1", &target.sin_addr);
+        if (connect(probe, (struct sockaddr*)&target, sizeof(target)) == 0) {
+            struct sockaddr_in src;
+            socklen_t sl = sizeof(src);
+            if (getsockname(probe, (struct sockaddr*)&src, &sl) == 0) {
+                strncpy(lan_ip, inet_ntoa(src.sin_addr), sizeof(lan_ip) - 1);
+            }
+        }
+        close(probe);
+    }
+
+    /* Timestamp */
     long uptime_proc = (long)(time(NULL) - start_time);
     time_t now = time(NULL);
     struct tm *tm = gmtime(&now);
     char ts[64];
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", tm);
 
+    /* Escape strings for JSON */
+    char emodel[128], ebrand[64];
+    json_escape(emodel, sizeof(emodel), device_model);
+    json_escape(ebrand, sizeof(ebrand), brand);
+
+    char buf[2048];
     snprintf(buf, sizeof(buf),
-        "{\"hostname\":\"tablet\",\"platform\":\"android\",\"arch\":\"arm64\","
+        "{\"hostname\":\"%s\",\"platform\":\"android\",\"arch\":\"arm64\","
+        "\"device\":{\"model\":\"%s\",\"brand\":\"%s\",\"android_version\":\"%s\"},"
+        "\"network\":{\"lan_ip\":\"%s\",\"port\":3001},"
         "\"cpu\":{\"model\":\"Unisoc T618\",\"cores\":8,\"speed_mhz\":0,"
         "\"load_avg\":{\"1m\":%.2f,\"5m\":%.2f,\"15m\":%.2f}},"
-        "\"memory\":{\"total_bytes\":%ld,\"used_bytes\":%ld,\"free_bytes\":%ld,\"used_percent\":%.1f},"
-        "\"process\":{\"rss_bytes\":0,\"heap_total_bytes\":0,\"heap_used_bytes\":0,\"external_bytes\":0},"
-        "\"uptime\":{\"system_seconds\":0,\"process_seconds\":%ld},"
+        "\"memory\":{\"total_bytes\":%ld,\"used_bytes\":%ld,\"free_bytes\":%ld,"
+        "\"available_bytes\":%ld,\"buffers_bytes\":%ld,\"cached_bytes\":%ld,"
+        "\"used_percent\":%.1f},"
+        "\"swap\":{\"total_bytes\":%ld,\"used_bytes\":%ld,\"free_bytes\":%ld,"
+        "\"used_percent\":%.1f},"
+        "\"disk\":{\"total_bytes\":%ld,\"used_bytes\":%ld,\"free_bytes\":%ld,"
+        "\"used_percent\":%d},"
+        "\"uptime\":{\"system_seconds\":%ld,\"process_seconds\":%ld},"
         "\"timestamp\":\"%s\"}",
-        l1, l5, l15, total, used, free_mem, used_pct, uptime_proc, ts);
+        hostname, emodel, ebrand, android_ver, lan_ip,
+        l1, l5, l15,
+        total, used, free_mem, avail, buffers, cached, used_pct,
+        swap_total, swap_used, swap_free, swap_pct,
+        disk_total, disk_used, disk_free, disk_pct,
+        sys_uptime_sec, uptime_proc, ts);
     send_json(fd, 200, "OK", buf);
 }
 

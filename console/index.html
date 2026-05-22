@@ -123,7 +123,33 @@
         </div>
       </div>
 
+      <div class="grid-3">
+        <div class="card stat-card">
+          <div class="stat-label">Swap used</div>
+          <div class="stat-value"><span id="sys-swap-pct">—</span><span class="unit">%</span></div>
+          <div class="stat-foot" id="sys-swap-detail">—</div>
+        </div>
+        <div class="card stat-card">
+          <div class="stat-label">Disk used</div>
+          <div class="stat-value"><span id="sys-disk-pct">—</span><span class="unit">%</span></div>
+          <div class="stat-foot" id="sys-disk-detail">—</div>
+        </div>
+        <div class="card stat-card">
+          <div class="stat-label">System uptime</div>
+          <div class="stat-value small" id="sys-uptime">—</div>
+          <div class="stat-foot" id="sys-uptime-detail">since boot</div>
+        </div>
+      </div>
+
       <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><h2>Host details</h2></div>
+          <table class="kv">
+            <tbody id="host-table">
+              <tr><td colspan="2" class="muted">loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
         <div class="card">
           <div class="card-head"><h2>Memory breakdown</h2></div>
           <div class="bar-stack" id="mem-bar">
@@ -136,10 +162,29 @@
             </tbody>
           </table>
         </div>
+      </div>
+
+      <div class="grid-2">
         <div class="card">
-          <div class="card-head"><h2>Process</h2></div>
+          <div class="card-head"><h2>Swap</h2></div>
+          <div class="bar-stack" id="swap-bar">
+            <div class="bar-seg seg-used" style="width:0%"></div>
+            <div class="bar-seg seg-free" style="width:0%"></div>
+          </div>
           <table class="kv">
-            <tbody id="proc-table">
+            <tbody id="swap-table">
+              <tr><td colspan="2" class="muted">loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Storage</h2></div>
+          <div class="bar-stack" id="disk-bar">
+            <div class="bar-seg seg-used" style="width:0%"></div>
+            <div class="bar-seg seg-free" style="width:0%"></div>
+          </div>
+          <table class="kv">
+            <tbody id="disk-table">
               <tr><td colspan="2" class="muted">loading…</td></tr>
             </tbody>
           </table>

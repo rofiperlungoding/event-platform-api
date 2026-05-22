@@ -79,33 +79,73 @@ database `status` is `"error"`.
 
 ### `GET /system`
 
-System metrics derived from `/proc/meminfo` and `/proc/loadavg`.
+Host telemetry from the tablet running the platform: device identity,
+CPU, memory, swap, storage, load, and network. Values are derived
+from `/proc/meminfo`, the `uptime` and `df` shell commands, and Android
+`getprop`. The endpoint is intentionally cheap (no DB access) and is
+polled by the operational dashboard at `console.<domain>/`.
 
 **Response 200**
 ```json
 {
-  "hostname": "tablet",
+  "hostname": "localhost",
   "platform": "android",
   "arch": "arm64",
+  "device": {
+    "model": "SM-X200",
+    "brand": "samsung",
+    "android_version": "14"
+  },
+  "network": {
+    "lan_ip": "192.168.100.67",
+    "port": 3001
+  },
   "cpu": {
     "model": "Unisoc T618",
     "cores": 8,
     "speed_mhz": 0,
-    "load_avg": { "1m": 0.42, "5m": 0.31, "15m": 0.27 }
+    "load_avg": { "1m": 6.06, "5m": 6.00, "15m": 6.03 }
   },
   "memory": {
-    "total_bytes": 3145728000,
-    "used_bytes": 1782656000,
-    "free_bytes": 1363072000,
-    "used_percent": 56.7
+    "total_bytes": 2595758080,
+    "used_bytes": 1768882176,
+    "free_bytes": 121827328,
+    "available_bytes": 725360640,
+    "buffers_bytes": 1294336,
+    "cached_bytes": 703754240,
+    "used_percent": 68.1
+  },
+  "swap": {
+    "total_bytes": 3221221376,
+    "used_bytes": 1602080768,
+    "free_bytes": 1619140608,
+    "used_percent": 49.7
+  },
+  "disk": {
+    "total_bytes": 23361204224,
+    "used_bytes": 9583669248,
+    "free_bytes": 13567819776,
+    "used_percent": 42
   },
   "uptime": {
-    "system_seconds": 0,
-    "process_seconds": 12345
+    "system_seconds": 1247700,
+    "process_seconds": 9
   },
-  "timestamp": "2026-05-22T08:00:00Z"
+  "timestamp": "2026-05-22T13:22:35Z"
 }
 ```
+
+**Notes on Android-specific limitations**
+
+- `/proc/loadavg`, `/proc/stat` and `/sys/class/power_supply/` are
+  permission-restricted on unrooted Android. Load average is therefore
+  parsed from the output of the `uptime` shell command. Battery and
+  thermal data are not available without a rooted device or the
+  optional `Termux:API` add-on.
+- `hostname` resolves to `localhost` on stock Termux; this is normal
+  and does not indicate a misconfiguration.
+- `lan_ip` is determined by opening a UDP socket toward `1.1.1.1:53`
+  (no packets sent) and reading the kernel's chosen source address.
 
 ### `GET /stats/database`
 

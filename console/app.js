@@ -98,7 +98,9 @@ function renderHealth(d) {
 
 function renderSystem(d) {
   // Region info in topbar
-  $('#region-text').textContent = `tabserve · ${d.platform}-${d.arch} · ${d.hostname}`;
+  const dev = d.device || {};
+  $('#region-text').textContent =
+    `${dev.brand ? dev.brand + ' ' : ''}${dev.model || d.hostname} · ${d.platform}-${d.arch}`;
 
   $('#sys-cores').textContent = d.cpu.cores || '—';
   $('#sys-cpu-model').textContent = d.cpu.model && d.cpu.model !== 'unknown'
@@ -108,28 +110,77 @@ function renderSystem(d) {
   $('#sys-load-detail').textContent =
     `5m ${d.cpu.load_avg['5m'].toFixed(2)} · 15m ${d.cpu.load_avg['15m'].toFixed(2)}`;
 
-  $('#sys-mem-pct').textContent = d.memory.used_percent.toFixed(1);
+  // Memory KPI + bar
+  const usedPct = d.memory.used_percent;
+  $('#sys-mem-pct').textContent = usedPct.toFixed(1);
   $('#sys-mem-detail').textContent =
     `${fmtBytes(d.memory.used_bytes)} of ${fmtBytes(d.memory.total_bytes)}`;
-
-  // Memory bar
-  const usedPct = d.memory.used_percent;
   $('#mem-bar .seg-used').style.width = `${usedPct}%`;
   $('#mem-bar .seg-free').style.width = `${100 - usedPct}%`;
 
+  // Swap KPI + bar
+  const swap = d.swap || {used_percent: 0, total_bytes: 0, used_bytes: 0, free_bytes: 0};
+  const swapPct = swap.used_percent || 0;
+  $('#sys-swap-pct').textContent = swapPct.toFixed(1);
+  $('#sys-swap-detail').textContent = swap.total_bytes
+    ? `${fmtBytes(swap.used_bytes)} of ${fmtBytes(swap.total_bytes)}`
+    : 'no swap';
+  $('#swap-bar .seg-used').style.width = `${swapPct}%`;
+  $('#swap-bar .seg-free').style.width = `${100 - swapPct}%`;
+
+  // Disk KPI + bar
+  const disk = d.disk || {used_percent: 0, total_bytes: 0, used_bytes: 0, free_bytes: 0};
+  const diskPct = disk.used_percent || 0;
+  $('#sys-disk-pct').textContent = diskPct;
+  $('#sys-disk-detail').textContent = disk.total_bytes
+    ? `${fmtBytes(disk.used_bytes)} of ${fmtBytes(disk.total_bytes)}`
+    : 'unknown';
+  $('#disk-bar .seg-used').style.width = `${diskPct}%`;
+  $('#disk-bar .seg-free').style.width = `${100 - diskPct}%`;
+
+  // System uptime KPI
+  const sysUp = d.uptime?.system_seconds || 0;
+  $('#sys-uptime').textContent = fmtUptime(sysUp);
+  $('#sys-uptime-detail').textContent = sysUp
+    ? `process: ${fmtUptime(d.uptime.process_seconds)}`
+    : `process uptime: ${fmtUptime(d.uptime?.process_seconds || 0)}`;
+
+  // Host details table — what the tablet actually is
+  const net = d.network || {};
+  $('#host-table').innerHTML = `
+    <tr><td>Device</td><td>${escapeHtml((dev.brand || '') + ' ' + (dev.model || ''))}</td></tr>
+    <tr><td>Android</td><td>${escapeHtml(dev.android_version || '?')}</td></tr>
+    <tr><td>Architecture</td><td>${escapeHtml(d.platform)}/${escapeHtml(d.arch)}</td></tr>
+    <tr><td>CPU</td><td>${escapeHtml(d.cpu.model)} · ${d.cpu.cores} cores</td></tr>
+    <tr><td>Hostname</td><td><code>${escapeHtml(d.hostname)}</code></td></tr>
+    <tr><td>LAN IP</td><td><code>${escapeHtml(net.lan_ip || '—')}:${net.port || 3001}</code></td></tr>
+    <tr><td>System uptime</td><td>${fmtUptime(sysUp)}</td></tr>
+    <tr><td>Process uptime</td><td>${fmtUptime(d.uptime?.process_seconds || 0)}</td></tr>
+    <tr><td>Last reading</td><td class="muted small">${fmtTime(d.timestamp)}</td></tr>
+  `;
+
+  // Memory breakdown
   $('#mem-table').innerHTML = `
     <tr><td>Total</td><td>${fmtBytes(d.memory.total_bytes)}</td></tr>
     <tr><td>Used</td><td>${fmtBytes(d.memory.used_bytes)} (${usedPct.toFixed(1)}%)</td></tr>
+    <tr><td>Available</td><td>${fmtBytes(d.memory.available_bytes || d.memory.free_bytes)}</td></tr>
     <tr><td>Free</td><td>${fmtBytes(d.memory.free_bytes)}</td></tr>
-    <tr><td>System uptime</td><td>${fmtUptime(d.uptime.system_seconds)}</td></tr>
+    <tr><td>Buffers</td><td>${fmtBytes(d.memory.buffers_bytes || 0)}</td></tr>
+    <tr><td>Cached</td><td>${fmtBytes(d.memory.cached_bytes || 0)}</td></tr>
   `;
 
-  $('#proc-table').innerHTML = `
-    <tr><td>RSS</td><td>${fmtBytes(d.process.rss_bytes)}</td></tr>
-    <tr><td>Heap total</td><td>${fmtBytes(d.process.heap_total_bytes)}</td></tr>
-    <tr><td>Heap used</td><td>${fmtBytes(d.process.heap_used_bytes)}</td></tr>
-    <tr><td>External</td><td>${fmtBytes(d.process.external_bytes)}</td></tr>
-    <tr><td>Process uptime</td><td>${fmtUptime(d.uptime.process_seconds)}</td></tr>
+  // Swap breakdown
+  $('#swap-table').innerHTML = `
+    <tr><td>Total</td><td>${fmtBytes(swap.total_bytes)}</td></tr>
+    <tr><td>Used</td><td>${fmtBytes(swap.used_bytes)} (${swapPct.toFixed(1)}%)</td></tr>
+    <tr><td>Free</td><td>${fmtBytes(swap.free_bytes)}</td></tr>
+  `;
+
+  // Disk breakdown
+  $('#disk-table').innerHTML = `
+    <tr><td>Total</td><td>${fmtBytes(disk.total_bytes)}</td></tr>
+    <tr><td>Used</td><td>${fmtBytes(disk.used_bytes)} (${diskPct}%)</td></tr>
+    <tr><td>Free</td><td>${fmtBytes(disk.free_bytes)}</td></tr>
   `;
 }
 
