@@ -1314,12 +1314,14 @@ static void handle_deploy_webhook(int fd, const char *headers, const char *body,
         return;
     }
 
-    /* Determine which repo from path: /deploy/api or /deploy/console or /deploy/run/<script> */
+    /* Determine which repo from path: /deploy/api or /deploy/console or /deploy/run/<script>.
+     * /deploy/api and /deploy/console both run deploy-api.sh because the
+     * console is a subfolder of the unified repo — a git pull picks up
+     * both API and frontend changes in one operation. The two paths are
+     * preserved for backward compatibility with the GitHub webhooks. */
     const char *script;
-    if (strstr(path, "/deploy/api?")) {
+    if (strstr(path, "/deploy/api?") || strstr(path, "/deploy/console?")) {
         script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/deploy-api.sh";
-    } else if (strstr(path, "/deploy/console?")) {
-        script = "/data/data/com.termux/files/home/projects/event-platform-console/deploy.sh";
     } else if (strstr(path, "/deploy/run/")) {
         /* Allowlist scripts that can be run via webhook */
         const char *p = strstr(path, "/deploy/run/") + 12;
@@ -2397,7 +2399,7 @@ int main(void) {
 
     const char *sd = getenv("STATIC_DIR");
     snprintf(static_dir, sizeof(static_dir), "%s",
-        sd ? sd : "/data/data/com.termux/files/home/projects/event-platform-console");
+        sd ? sd : "/data/data/com.termux/files/home/projects/event-platform-api/console");
 
     const char *secret = getenv("JWT_SECRET");
     snprintf(jwt_secret, sizeof(jwt_secret), "%s",

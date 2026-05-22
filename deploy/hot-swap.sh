@@ -21,7 +21,7 @@ PORT=$SMOKE_PORT \
 DATABASE_URL="postgresql://rofi:devsecret@localhost:5432/eventplatform" \
 JWT_SECRET="intrivia2026secret" \
 WEBHOOK_SECRET="intriviadeploy2026" \
-STATIC_DIR=/data/data/com.termux/files/home/projects/event-platform-console \
+STATIC_DIR=/data/data/com.termux/files/home/projects/event-platform-api/console \
 ./event-server-staging >> "$LOG" 2>&1 &
 SMOKE_PID=$!
 sleep 2
@@ -46,7 +46,7 @@ PORT=3001 \
 DATABASE_URL="postgresql://rofi:devsecret@localhost:5432/eventplatform" \
 JWT_SECRET="intrivia2026secret" \
 WEBHOOK_SECRET="intriviadeploy2026" \
-STATIC_DIR=/data/data/com.termux/files/home/projects/event-platform-console \
+STATIC_DIR=/data/data/com.termux/files/home/projects/event-platform-api/console \
 pm2 start ./event-server --name event-server >> "$LOG" 2>&1
 pm2 save >> "$LOG" 2>&1
 

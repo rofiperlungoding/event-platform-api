@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+<meta name="theme-color" content="#0f1419"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<title>Check In</title>
+<link rel="manifest" href="/attend/manifest.json"/>
+<link rel="icon" href="/attend/icon-192.svg"/>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+:root{--bg:#0f1419;--card:#1c2530;--accent:#ec7211;--green:#2e8b57;--red:#f85149;--text:#e8eaed;--muted:#8b949e;--mono:ui-monospace,Consolas,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;display:flex;flex-direction:column;align-items:center;padding:16px}
+h1{font-size:18px;margin-bottom:4px}
+.sub{color:var(--muted);font-size:12px;margin-bottom:16px}
+.card{background:var(--card);border-radius:8px;padding:20px;width:100%;max-width:400px;margin-bottom:16px}
+.card h2{font-size:14px;color:var(--muted);margin-bottom:12px}
+input{width:100%;padding:10px 12px;margin-bottom:10px;background:#0f1419;border:1px solid #333;border-radius:4px;color:var(--text);font-size:14px}
+.btn{width:100%;padding:12px;border:none;border-radius:6px;font-weight:600;font-size:14px;cursor:pointer;margin-bottom:8px}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:#d4650f}
+.btn-scan{background:var(--green);color:#fff;font-size:16px;padding:16px}
+.btn-scan:hover{background:#257a48}
+.status{text-align:center;padding:16px;border-radius:8px;margin-bottom:16px;font-weight:600;font-size:15px;display:none;width:100%;max-width:400px}
+.status.success{display:block;background:#1a3a2a;color:#4ade80;border:1px solid #2e8b57}
+.status.error{display:block;background:#3a1a1a;color:#f85149;border:1px solid #f85149}
+.status.info{display:block;background:#1a2a3a;color:#58a6ff;border:1px solid #58a6ff}
+.status.queued{display:block;background:#3a2a1a;color:#ec7211;border:1px solid #ec7211}
+.user-info{text-align:center;margin-bottom:16px}
+.user-info .name{font-size:20px;font-weight:700}
+.user-info .team{color:var(--accent);font-family:var(--mono);font-size:13px;margin-top:4px}
+.user-info .device{color:var(--muted);font-family:var(--mono);font-size:11px;margin-top:4px}
+#reader{width:100%;max-width:400px;margin-bottom:16px;border-radius:8px;overflow:hidden}
+.hidden{display:none!important}
+.history{width:100%;max-width:400px}
+.history h3{font-size:13px;color:var(--muted);margin-bottom:8px;display:flex;justify-content:space-between}
+.history-item{padding:10px 12px;background:var(--card);border-radius:4px;margin-bottom:4px;font-size:13px;display:flex;align-items:center;gap:8px}
+.history-item .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.history-item .dot.synced{background:var(--green)}
+.history-item .dot.pending{background:var(--accent)}
+.history-item .text{font-family:var(--mono);color:var(--muted)}
+.offline-badge{position:fixed;top:8px;right:8px;background:var(--red);color:#fff;font-size:11px;padding:4px 8px;border-radius:4px;font-family:var(--mono);display:none}
+.offline-badge.show{display:block}
+.queue-count{font-family:var(--mono);color:var(--accent);font-size:12px}
+</style>
+</head>
+<body>
+<div class="offline-badge" id="offline-badge">OFFLINE</div>
+<h1>📋 Event Check-In</h1>
+<p class="sub">scan QR · works offline</p>
+
+<div id="status" class="status"></div>
+
+<!-- Auth Phase -->
+<div class="card" id="auth-card">
+  <h2>Login or Register</h2>
+  <input id="a-name" placeholder="Name"/>
+  <input id="a-email" placeholder="Email" type="email"/>
+  <input id="a-team" placeholder="Team"/>
+  <input id="a-password" placeholder="Password" type="password"/>
+  <button class="btn btn-primary" onclick="authRegister()">Register & Link Device</button>
+  <button class="btn btn-primary" style="background:#333" onclick="authLogin()">Login</button>
+</div>
+
+<!-- Scan Phase -->
+<div class="hidden" id="scan-phase">
+  <div class="user-info">
+    <div class="name" id="user-name">—</div>
+    <div class="team" id="user-team">—</div>
+    <div class="device" id="user-device">—</div>
+  </div>
+  <button class="btn btn-scan" id="btn-start-scan" onclick="startScan()">📷 Scan QR to Check In</button>
+  <div id="reader"></div>
+  <div class="history" id="history">
+    <h3><span>History</span><span class="queue-count" id="queue-count"></span></h3>
+  </div>
+</div>
+
+<script>
+/* ─── API endpoint resolver ───────────────────────────────────────────
+ * On a venue Wi-Fi, every attendee can reach the tablet at its LAN IP
+ * directly — bypassing the Cloudflare Tunnel entirely. The tunnel is
+ * only needed for attendees on cellular or off-network. We probe the
+ * LAN endpoint with a 1.5 s timeout once per page load; if it answers,
+ * we use it for the rest of the session. Otherwise we fall back to the
+ * public tunnel hostname.
+ *
+ * Operators can override the LAN IP via ?lan=... query string or
+ * localStorage `ep_lan_url` so the same PWA works on different
+ * deployments. */
+const PUBLIC_API = 'https://api.rofidoesthings.site';
+const DEFAULT_LAN_API = 'http://192.168.100.67:3001';
+const LAN_OVERRIDE = new URL(location.href).searchParams.get('lan')
+                  || localStorage.getItem('ep_lan_url')
+                  || DEFAULT_LAN_API;
+let API = PUBLIC_API;
+
+async function resolveApi() {
+  if (!LAN_OVERRIDE) return PUBLIC_API;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 1500);
+    const r = await fetch(`${LAN_OVERRIDE}/health`, {signal: ctl.signal, cache: 'no-store'});
+    clearTimeout(t);
+    if (r.ok) {
+      console.log('[api] using LAN endpoint:', LAN_OVERRIDE);
+      return LAN_OVERRIDE;
+    }
+  } catch (e) {
+    console.log('[api] LAN probe failed, using tunnel:', e.message);
+  }
+  return PUBLIC_API;
+}
+let token = localStorage.getItem('ep_token') || '';
+let deviceId = localStorage.getItem('ep_device_id') || '';
+let userName = '', userTeam = '';
+let scanner = null;
+let isOnline = navigator.onLine;
+
+// Device ID
+if (!deviceId) {
+  deviceId = 'dev-' + crypto.randomUUID();
+  localStorage.setItem('ep_device_id', deviceId);
+}
+
+// ─── IndexedDB for offline queue ────────────────────────────────────────
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('checkin-queue', 1);
+    req.onupgradeneeded = e => {
+      e.target.result.createObjectStore('queue', {keyPath: 'id', autoIncrement: true});
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+async function addToQueue(sessionCode) {
+  const db = await openDB();
+  const tx = db.transaction('queue', 'readwrite');
+  tx.objectStore('queue').add({
+    /* Queue uses quick-checkin (device-keyed, no auth round trip).
+     * On drain we prefer /attendance/batch-checkin for a single transaction. */
+    code: sessionCode,
+    device_uuid: deviceId,
+    timestamp: Date.now(),
+  });
+  updateQueueCount();
+}
+
+async function getQueueCount() {
+  const db = await openDB();
+  return new Promise(resolve => {
+    const tx = db.transaction('queue', 'readonly');
+    const req = tx.objectStore('queue').count();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(0);
+  });
+}
+
+async function processQueue() {
+  const db = await openDB();
+  const tx = db.transaction('queue', 'readonly');
+  const store = tx.objectStore('queue');
+  const items = await new Promise(r => { const req = store.getAll(); req.onsuccess = () => r(req.result); });
+  if (items.length === 0) return;
+
+  /* Group by session code, drain each group in a single batch-checkin call */
+  const bySession = {};
+  for (const it of items) {
+    const code = it.code || (it.body && JSON.parse(it.body).session_code);
+    if (!code) continue;
+    (bySession[code] = bySession[code] || []).push(it);
+  }
+
+  let synced = 0;
+  for (const [code, group] of Object.entries(bySession)) {
+    try {
+      const r = await fetch(`${API}/attendance/batch-checkin`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          session_code: code,
+          items: group.map(g => ({device_uuid: g.device_uuid || deviceId})),
+        }),
+      });
+      if (!r.ok) continue;
+      const d = await r.json();
+      /* All attempted rows are now resolved server-side (accepted OR duplicate
+       * OR unknown) — drop all of them from the queue regardless. Duplicate
+       * means already checked in (success in real life), unknown means the
+       * device was unlinked and retrying won't help. */
+      const dtx = db.transaction('queue', 'readwrite');
+      const dst = dtx.objectStore('queue');
+      for (const g of group) dst.delete(g.id);
+      synced += (d.accepted || 0) + (d.duplicates || 0);
+    } catch (e) { break; }
+  }
+
+  if (synced > 0) {
+    showStatus(`✓ Synced ${synced} check-in${synced > 1 ? 's' : ''}`, 'success');
+    updateQueueCount();
+  }
+}
+
+async function updateQueueCount() {
+  const n = await getQueueCount();
+  document.getElementById('queue-count').textContent = n > 0 ? `${n} pending sync` : '';
+}
+
+// ─── Online/Offline detection ───────────────────────────────────────────
+window.addEventListener('online', () => {
+  isOnline = true;
+  document.getElementById('offline-badge').classList.remove('show');
+  processQueue(); // sync when back online
+});
+window.addEventListener('offline', () => {
+  isOnline = false;
+  document.getElementById('offline-badge').classList.add('show');
+});
+if (!isOnline) document.getElementById('offline-badge').classList.add('show');
+
+// ─── Service Worker Registration ────────────────────────────────────────
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/attend/sw.js').then(reg => {
+    // Register background sync
+    if ('sync' in reg) {
+      reg.sync.register('sync-checkins').catch(() => {});
+    }
+  });
+}
+
+// ─── Auth ───────────────────────────────────────────────────────────────
+(async () => {
+  /* Resolve the best endpoint (LAN if reachable, else tunnel) before
+   * any other request fires. This makes the difference between 100 %
+   * pass at 2,000 concurrent (LAN) and ~30 % pass (tunnel free tier). */
+  API = await resolveApi();
+
+  if (token) {
+    try {
+      const r = await fetch(`${API}/auth/me`, {headers:{'Authorization':`Bearer ${token}`}});
+      if (r.ok) {
+        const u = await r.json();
+        userName = u.name; userTeam = u.team;
+        showScanPhase();
+        return;
+      }
+    } catch(e) {
+      // Offline but have token — show scan anyway
+      userName = localStorage.getItem('ep_name') || 'Offline User';
+      userTeam = localStorage.getItem('ep_team') || '—';
+      showScanPhase();
+      return;
+    }
+    token = ''; localStorage.removeItem('ep_token');
+  }
+})();
+
+function showStatus(msg, type) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = `status ${type}`;
+  if (type === 'success' || type === 'queued') setTimeout(() => el.style.display = 'none', 5000);
+}
+
+function showScanPhase() {
+  document.getElementById('auth-card').classList.add('hidden');
+  document.getElementById('scan-phase').classList.remove('hidden');
+  document.getElementById('user-name').textContent = userName;
+  document.getElementById('user-team').textContent = userTeam;
+  document.getElementById('user-device').textContent = deviceId.slice(0, 16) + '...';
+  loadHistory();
+  updateQueueCount();
+}
+
+async function authRegister() {
+  const name = document.getElementById('a-name').value;
+  const email = document.getElementById('a-email').value;
+  const team = document.getElementById('a-team').value;
+  const password = document.getElementById('a-password').value;
+  if (!name || !email || !team || !password) { showStatus('Fill all fields', 'error'); return; }
+  try {
+    const r = await fetch(`${API}/auth/register`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, email, team, password})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    token = d.token;
+    localStorage.setItem('ep_token', token);
+    localStorage.setItem('ep_name', d.participant.name);
+    localStorage.setItem('ep_team', d.participant.team);
+    userName = d.participant.name;
+    userTeam = d.participant.team;
+    await fetch(`${API}/device/link`, {
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
+      body: JSON.stringify({device_uuid: deviceId, user_agent: navigator.userAgent})
+    });
+    showStatus('Registered!', 'success');
+    showScanPhase();
+  } catch(e) { showStatus(e.message, 'error'); }
+}
+
+async function authLogin() {
+  const email = document.getElementById('a-email').value;
+  const password = document.getElementById('a-password').value;
+  if (!email || !password) { showStatus('Enter email & password', 'error'); return; }
+  try {
+    const r = await fetch(`${API}/auth/login`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({email, password})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    token = d.token;
+    localStorage.setItem('ep_token', token);
+    localStorage.setItem('ep_name', d.participant.name);
+    localStorage.setItem('ep_team', d.participant.team);
+    userName = d.participant.name;
+    userTeam = d.participant.team;
+    await fetch(`${API}/device/link`, {
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
+      body: JSON.stringify({device_uuid: deviceId, user_agent: navigator.userAgent})
+    });
+    showStatus('Logged in!', 'success');
+    showScanPhase();
+  } catch(e) { showStatus(e.message, 'error'); }
+}
+
+// ─── Scanner ────────────────────────────────────────────────────────────
+function startScan() {
+  document.getElementById('btn-start-scan').classList.add('hidden');
+  scanner = new Html5Qrcode("reader");
+  scanner.start(
+    { facingMode: "environment" },
+    { fps: 10, qrbox: { width: 250, height: 250 } },
+    onScanSuccess,
+    () => {}
+  ).catch(err => {
+    showStatus('Camera: ' + err, 'error');
+    document.getElementById('btn-start-scan').classList.remove('hidden');
+  });
+}
+
+/* Smart retry helper — same idempotency-aware retry the load test uses.
+ * device_uuid + session_code is unique server-side, so retries cannot
+ * cause duplicate attendance. */
+async function fetchWithRetry(url, init, opts = {}) {
+  const PER_TRY_TIMEOUT = opts.timeout || 6000;
+  const MAX_TRIES = opts.maxTries || 5;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), PER_TRY_TIMEOUT);
+    try {
+      const r = await fetch(url, {...init, signal: ctl.signal});
+      clearTimeout(timer);
+      /* 2xx and 4xx are deterministic — return immediately */
+      if (r.status < 500) return r;
+      lastErr = new Error('server ' + r.status);
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+    }
+    /* Jittered exponential backoff: 100, 200, 400, 800 ms ± 30 % */
+    const base = 100 * Math.pow(2, attempt - 1);
+    const delay = base + Math.floor(Math.random() * base * 0.6);
+    await new Promise(r => setTimeout(r, delay));
+  }
+  throw lastErr || new Error('all retries exhausted');
+}
+
+async function onScanSuccess(decoded) {
+  if (scanner) { await scanner.stop(); scanner = null; }
+  document.getElementById('btn-start-scan').classList.remove('hidden');
+
+  let data;
+  try { data = JSON.parse(decoded); } catch(e) { showStatus('Invalid QR', 'error'); return; }
+  if (!data.code) { showStatus('Invalid QR format', 'error'); return; }
+
+  // Try online first
+  if (isOnline) {
+    try {
+      /* Use device-keyed quick-checkin: no auth round trip, server resolves
+       * device_uuid → participant in a single SQL CTE. This is the path that
+       * scales to 2000 simultaneous attendees. With smart retry, transient
+       * failures (network blip, tunnel hiccup) auto-recover before the user
+       * even sees an error. */
+      const r = await fetchWithRetry(`${API}/attendance/quick-checkin`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({session_code: data.code, device_uuid: deviceId})
+      });
+      const d = await r.json();
+      if (r.ok) {
+        showStatus('✓ Checked in!', 'success');
+        addHistoryItem(new Date().toISOString(), true);
+        return;
+      }
+      if (r.status === 409) { showStatus('Already checked in', 'info'); return; }
+      if (r.status === 401) {
+        /* Device not linked — fall back to authenticated checkin which links on the fly */
+        const fb = await fetchWithRetry(`${API}/attendance/checkin`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
+          body: JSON.stringify({session_code: data.code, device_id: deviceId})
+        });
+        const fd = await fb.json();
+        if (fb.ok) { showStatus('✓ Checked in!', 'success'); addHistoryItem(new Date().toISOString(), true); return; }
+        if (fb.status === 409) { showStatus('Already checked in', 'info'); return; }
+        throw new Error(fd.error || 'Server error');
+      }
+      throw new Error(d.error || 'Server error');
+    } catch(e) {
+      /* All retries exhausted → queue offline. The queue drains via
+       * /attendance/batch-checkin once the network recovers. */
+      await addToQueue(data.code);
+      showStatus('📦 Queued — will sync automatically', 'queued');
+      addHistoryItem(new Date().toISOString(), false);
+      triggerSync();
+      return;
+    }
+  }
+
+  // Offline — queue locally
+  await addToQueue(data.code);
+  showStatus('📦 Saved offline — will sync automatically', 'queued');
+  addHistoryItem(new Date().toISOString(), false);
+  triggerSync();
+}
+
+function triggerSync() {
+  if ('serviceWorker' in navigator && navigator.serviceWorker.ready) {
+    navigator.serviceWorker.ready.then(reg => {
+      if ('sync' in reg) reg.sync.register('sync-checkins');
+    });
+  }
+}
+
+async function loadHistory() {
+  try {
+    if (!isOnline) return;
+    const r = await fetch(`${API}/attendance/me`, {headers:{'Authorization':`Bearer ${token}`}});
+    if (!r.ok) return;
+    const list = await r.json();
+    for (const item of list.slice(0, 5)) {
+      addHistoryItem(item.checkedInAt, true);
+    }
+  } catch(e) {}
+}
+
+function addHistoryItem(ts, synced) {
+  const el = document.createElement('div');
+  el.className = 'history-item';
+  el.innerHTML = `<span class="dot ${synced ? 'synced' : 'pending'}"></span><span class="text">${new Date(ts).toLocaleString(undefined,{hour12:false})}</span>`;
+  const hist = document.getElementById('history');
+  if (hist.children.length > 1) hist.insertBefore(el, hist.children[1]);
+  else hist.appendChild(el);
+}
+</script>
+</body>
+</html>

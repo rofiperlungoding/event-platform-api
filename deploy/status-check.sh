@@ -4,7 +4,7 @@
 
 trap - CHLD
 
-OUT="$HOME/projects/event-platform-console/status.json"
+OUT="$HOME/projects/event-platform-api/console/status.json"
 
 cat > "$OUT" <<EOF
 {

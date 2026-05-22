@@ -1,0 +1,12 @@
+{
+  "name": "Event Check-In",
+  "short_name": "CheckIn",
+  "start_url": "/attend/scan.html",
+  "display": "standalone",
+  "background_color": "#0f1419",
+  "theme_color": "#ec7211",
+  "icons": [
+    {"src": "/attend/icon-192.svg", "sizes": "192x192", "type": "image/svg+xml"},
+    {"src": "/attend/icon-512.svg", "sizes": "512x512", "type": "image/svg+xml"}
+  ]
+}

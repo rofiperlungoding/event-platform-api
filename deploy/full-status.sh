@@ -2,7 +2,7 @@
 # Comprehensive status report for verifying Round 1 setup
 trap - CHLD
 
-OUT="$HOME/projects/event-platform-console/full-status.json"
+OUT="$HOME/projects/event-platform-api/console/full-status.json"
 
 # Build JSON manually
 cat > "$OUT" <<EOF

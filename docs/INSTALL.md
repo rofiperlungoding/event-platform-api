@@ -63,7 +63,7 @@ PORT=3001 \
 DATABASE_URL=postgresql://rofi:devsecret@localhost:5432/eventplatform \
 JWT_SECRET=intrivia2026secret \
 WEBHOOK_SECRET=intriviadeploy2026 \
-STATIC_DIR=$HOME/projects/event-platform-console \
+STATIC_DIR=$HOME/projects/event-platform-api/console \
 ./event-server
 ```
 
@@ -79,7 +79,7 @@ PORT=3001 \
 DATABASE_URL=postgresql://rofi:devsecret@localhost:5432/eventplatform \
 JWT_SECRET=intrivia2026secret \
 WEBHOOK_SECRET=intriviadeploy2026 \
-STATIC_DIR=$HOME/projects/event-platform-console \
+STATIC_DIR=$HOME/projects/event-platform-api/console \
 pm2 start ./event-server --name event-server
 pm2 save
 ```
@@ -141,7 +141,7 @@ This installs:
 ## 8. Static frontend
 
 ```bash
-git clone git@github.com:<you>/event-platform-console.git ~/projects/event-platform-console
+git clone git@github.com:<you>/event-platform-api/console.git ~/projects/event-platform-api/console
 ```
 
 The C server serves files from `STATIC_DIR` — no separate web server is

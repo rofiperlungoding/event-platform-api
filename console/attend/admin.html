@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Attendance — Admin QR</title>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+<style>
+:root{--bg:#0f1419;--card:#1c2530;--accent:#ec7211;--green:#2e8b57;--text:#e8eaed;--muted:#8b949e;--mono:ui-monospace,"Cascadia Mono",Consolas,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px}
+h1{font-size:20px;margin-bottom:4px}
+.sub{color:var(--muted);font-size:13px;font-family:var(--mono);margin-bottom:24px}
+.login-box{background:var(--card);padding:24px;border-radius:8px;width:100%;max-width:360px;margin-bottom:24px}
+.login-box input{width:100%;padding:10px 12px;margin-bottom:12px;background:#0f1419;border:1px solid #333;border-radius:4px;color:var(--text);font-size:14px}
+.login-box button{width:100%;padding:10px;background:var(--accent);border:none;border-radius:4px;color:#fff;font-weight:600;font-size:14px;cursor:pointer}
+.login-box button:hover{background:#d4650f}
+.error{color:#f85149;font-size:13px;margin-top:8px}
+.qr-container{display:none;text-align:center}
+.qr-wrap{background:#fff;padding:24px;border-radius:12px;display:inline-block;margin-bottom:16px}
+.code-display{font-family:var(--mono);font-size:32px;font-weight:700;letter-spacing:4px;color:var(--accent);margin-bottom:8px}
+.timer{font-family:var(--mono);font-size:14px;color:var(--muted);margin-bottom:24px}
+.timer .sec{color:var(--accent);font-weight:600}
+.feed{width:100%;max-width:500px;text-align:left}
+.feed h2{font-size:15px;margin-bottom:12px;color:var(--muted)}
+.feed-item{display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--card);border-radius:6px;margin-bottom:6px;animation:fadeIn .3s}
+.feed-item .avatar{width:32px;height:32px;border-radius:50%;background:var(--accent);display:grid;place-items:center;font-weight:700;font-size:13px;color:#fff;flex-shrink:0}
+.feed-item .info{flex:1}
+.feed-item .name{font-weight:600;font-size:14px}
+.feed-item .meta{font-size:12px;color:var(--muted);font-family:var(--mono)}
+.feed-item .time{font-size:12px;color:var(--green);font-family:var(--mono)}
+.count{font-family:var(--mono);font-size:48px;font-weight:700;color:var(--green);margin-bottom:4px}
+.count-label{font-size:13px;color:var(--muted);margin-bottom:24px}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+.btn-stop{margin-top:16px;padding:8px 16px;background:#333;border:1px solid #555;border-radius:4px;color:var(--text);cursor:pointer;font-size:13px}
+</style>
+</head>
+<body>
+<h1>Attendance Session</h1>
+<p class="sub">admin panel — generate QR for participants to scan</p>
+
+<div class="login-box" id="login-box">
+  <input type="email" id="email" placeholder="Admin email" value="admin@intrivia.test"/>
+  <input type="password" id="password" placeholder="Password" value="admin123"/>
+  <button onclick="login()">Login & Start Session</button>
+  <div class="error" id="login-error"></div>
+</div>
+
+<div class="qr-container" id="qr-container">
+  <div class="count" id="checkin-count">0</div>
+  <div class="count-label">checked in</div>
+  <div class="qr-wrap"><div id="qr-display"></div><div id="qr-preload" style="display:none"></div></div>
+  <div class="code-display" id="code-display">--------</div>
+  <div class="timer">Refreshes in <span class="sec" id="timer-sec">30</span>s</div>
+  <div class="feed" id="feed">
+    <h2>Live check-ins</h2>
+  </div>
+  <button class="btn-stop" onclick="stopSession()">Stop Session</button>
+</div>
+
+<script>
+const API = 'https://api.rofidoesthings.site';
+let token = '', sessionId = null, sessionCode = '', refreshInterval = null, countdown = 30, seenIds = new Set();
+
+async function login() {
+  const email = document.getElementById('email').value;
+  const pw = document.getElementById('password').value;
+  try {
+    const r = await fetch(`${API}/auth/login`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({email, password: pw})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Login failed');
+    if (d.participant.role !== 'admin') throw new Error('Admin access required');
+    token = d.token;
+    await createSession();
+  } catch(e) {
+    document.getElementById('login-error').textContent = e.message;
+  }
+}
+
+async function createSession() {
+  const r = await fetch(`${API}/sessions/create`, {
+    method: 'POST', headers: {'Authorization': `Bearer ${token}`}
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error);
+  sessionId = d.id;
+  sessionCode = d.code;
+  document.getElementById('login-box').style.display = 'none';
+  document.getElementById('qr-container').style.display = 'block';
+  updateQR();
+  countdown = 30;
+  refreshInterval = setInterval(tick, 1000);
+  /* Open WebSocket for live attendance feed (replaces 2s polling) */
+  openLiveFeed();
+}
+
+let ws = null;
+function openLiveFeed() {
+  const wsUrl = API.replace('https://', 'wss://').replace('http://', 'ws://');
+  ws = new WebSocket(`${wsUrl}/ws/attendance/${sessionId}?token=${encodeURIComponent(token)}`);
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.event === 'checkin') {
+        if (!seenIds.has(msg.id)) {
+          seenIds.add(msg.id);
+          addFeedItem(msg);
+          document.getElementById('checkin-count').textContent = seenIds.size;
+        }
+      }
+    } catch (_) {}
+  };
+  ws.onclose = () => {
+    /* Auto-reconnect after 3 seconds */
+    setTimeout(() => { if (sessionId) openLiveFeed(); }, 3000);
+  };
+  ws.onerror = (e) => console.error('WS error', e);
+}
+
+function updateQR() {
+  document.getElementById('code-display').textContent = sessionCode;
+  const payload = JSON.stringify({code: sessionCode, api: API});
+  const qr = qrcode(0, 'M');
+  qr.addData(payload);
+  qr.make();
+  document.getElementById('qr-display').innerHTML = qr.createSvgTag({cellSize: 6, margin: 0});
+}
+
+// Preload next QR so swap is instant
+let nextCode = '';
+async function preloadNextQR() {
+  try {
+    const r = await fetch(`${API}/sessions/${sessionId}/refresh`, {
+      method: 'POST', headers: {'Authorization': `Bearer ${token}`}
+    });
+    const d = await r.json();
+    if (r.ok) {
+      nextCode = d.code;
+      const payload = JSON.stringify({code: nextCode, api: API});
+      const qr = qrcode(0, 'M');
+      qr.addData(payload);
+      qr.make();
+      document.getElementById('qr-preload').innerHTML = qr.createSvgTag({cellSize: 6, margin: 0});
+    }
+  } catch(e) { console.error(e); }
+}
+
+function swapToPreloaded() {
+  if (nextCode) {
+    sessionCode = nextCode;
+    document.getElementById('qr-display').innerHTML = document.getElementById('qr-preload').innerHTML;
+    document.getElementById('code-display').textContent = sessionCode;
+    nextCode = '';
+  }
+}
+
+async function tick() {
+  countdown--;
+  document.getElementById('timer-sec').textContent = countdown;
+  // Preload at 5 seconds before swap
+  if (countdown === 5 && !nextCode) { preloadNextQR(); }
+  if (countdown <= 0) {
+    countdown = 30;
+    if (nextCode) {
+      swapToPreloaded();
+    } else {
+      // Fallback: refresh inline if preload failed
+      try {
+        const r = await fetch(`${API}/sessions/${sessionId}/refresh`, {
+          method: 'POST', headers: {'Authorization': `Bearer ${token}`}
+        });
+        const d = await r.json();
+        if (r.ok) { sessionCode = d.code; updateQR(); }
+      } catch(e) { console.error(e); }
+    }
+  }
+}
+
+function addFeedItem(item) {
+  const feed = document.getElementById('feed');
+  const initials = item.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+  const time = new Date(item.checkedInAt).toLocaleTimeString(undefined,{hour12:false});
+  const el = document.createElement('div');
+  el.className = 'feed-item';
+  el.innerHTML = `
+    <div class="avatar">${initials}</div>
+    <div class="info">
+      <div class="name">${item.name}</div>
+      <div class="meta">${item.team} · ${item.device_id}</div>
+    </div>
+    <div class="time">${time}</div>
+  `;
+  feed.insertBefore(el, feed.children[1]); // after h2
+}
+
+function stopSession() {
+  clearInterval(refreshInterval);
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  sessionId = null;
+  document.getElementById('qr-container').innerHTML = '<h2 style="color:var(--muted);margin-top:48px">Session ended</h2><p style="color:var(--muted);font-size:14px;margin-top:8px">' + seenIds.size + ' total check-ins</p>';
+}
+</script>
+</body>
+</html>

@@ -49,7 +49,7 @@ echo "[$(date)] ✓ Compile OK" >> "$LOG"
 echo "[$(date)] Smoke testing on port 3099..." >> "$LOG"
 PORT=3099 \
 DATABASE_URL="postgresql://rofi:devsecret@localhost:5432/eventplatform" \
-STATIC_DIR="$HOME/projects/event-platform-console" \
+STATIC_DIR="$HOME/projects/event-platform-api/console" \
 JWT_SECRET="${JWT_SECRET:-intrivia2026secret}" \
 WEBHOOK_SECRET="${WEBHOOK_SECRET:-intriviadeploy2026}" \
 nohup ./event-server-staging > /dev/null 2>&1 &

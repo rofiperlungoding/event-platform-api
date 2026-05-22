@@ -21,7 +21,7 @@
 │                └─ 8 forked workers (shared listening fd)     │
 │                                                              │
 │   Postgres 18 (native Termux service)                        │
-│   Static files (event-platform-console)                      │
+│   Static files (event-platform-api/console)                      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
