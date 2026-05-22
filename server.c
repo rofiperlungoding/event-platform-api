@@ -1118,6 +1118,7 @@ static void handle_deploy_webhook(int fd, const char *headers, const char *body,
         else if (strcmp(name, "status-check") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/status-check.sh";
         else if (strcmp(name, "full-status") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/full-status.sh";
         else if (strcmp(name, "rollback") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/rollback.sh";
+        else if (strcmp(name, "replicate-supabase") == 0) script = "/data/data/com.termux/files/home/projects/event-platform-api/deploy/replicate-supabase.sh";
         else if (strcmp(name, "install-boot") == 0) {
             /* Inline command: copy boot-script.sh to ~/.termux/boot/ and chmod +x */
             snprintf(buf, sizeof(buf), "%s/projects/event-platform-api/deploy/install-boot.sh", getenv("HOME"));

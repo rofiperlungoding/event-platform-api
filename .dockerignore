@@ -1,0 +1,16 @@
+.git
+.github
+.gitignore
+.dockerignore
+docker-compose*.yml
+Dockerfile
+README.md
+docs/
+deploy/
+loadtest/
+tui/
+node_modules/
+*.log
+*.bak
+event-server
+event-server-*

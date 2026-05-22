@@ -11,7 +11,8 @@ pkg install -y cronie >/dev/null 2>&1 || true
 # Cron jobs (use absolute paths since cron has minimal env)
 JOBS=(
   "0 3 * * * /data/data/com.termux/files/usr/bin/bash /data/data/com.termux/files/home/projects/event-platform-api/deploy/db-backup.sh"
-  "0 4 * * 0 /data/data/com.termux/files/usr/bin/pm2 flush"
+  "0 4 * * * /data/data/com.termux/files/usr/bin/bash /data/data/com.termux/files/home/projects/event-platform-api/deploy/replicate-supabase.sh"
+  "0 5 * * 0 /data/data/com.termux/files/usr/bin/pm2 flush"
   "*/5 * * * * /data/data/com.termux/files/usr/bin/bash /data/data/com.termux/files/home/projects/event-platform-api/deploy/health-watchdog.sh"
 )
 

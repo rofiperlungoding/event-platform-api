@@ -326,6 +326,23 @@ For deployments on hosts with a static public IP (VPS, dedicated
 server), see [`docs/REVERSE_PROXY.md`](docs/REVERSE_PROXY.md) for an
 Nginx-based topology that replaces Cloudflare Tunnel.
 
+### Alternative: Docker Compose
+
+For development laptops, VPS hosts, or any non-Termux Linux environment,
+the repository includes a [`Dockerfile`](Dockerfile) and
+[`docker-compose.yml`](docker-compose.yml). Quick start:
+
+```bash
+docker compose up -d
+curl http://localhost:3000/health
+```
+
+### Read-only Replication to Supabase
+
+Daily one-way replication from the tablet to a hosted Supabase project
+provides geographic redundancy and a read-only failover surface. See
+[`docs/REPLICATION.md`](docs/REPLICATION.md) for setup.
+
 ### Continuous Deployment
 
 After initial bootstrap, ongoing deployment is fully automated:
@@ -395,6 +412,8 @@ curl 'https://console.example.com/full-status.json'
 ```
 event-platform-api/
 ├── server.c                      # Main application source (single file)
+├── Dockerfile                    # Multi-stage container build
+├── docker-compose.yml            # Local development stack
 ├── migrations/
 │   ├── 002_auth_attendance.sql
 │   ├── 003_named_sessions.sql
@@ -405,6 +424,8 @@ event-platform-api/
 │   ├── rollback.sh               # Restore previous binary
 │   ├── health-watchdog.sh        # 5-min cron: detect + recover + alert
 │   ├── db-backup.sh              # Daily pg_dump
+│   ├── replicate-supabase.sh     # Daily mirror to Supabase
+│   ├── send-email.sh             # SMTP wrapper for notifications
 │   ├── setup-cron.sh             # Install all cron jobs
 │   ├── boot-script.sh            # Termux:Boot autostart
 │   ├── install-boot.sh           # Place boot-script in correct location
@@ -412,7 +433,8 @@ event-platform-api/
 │   └── full-status.sh            # Comprehensive status report
 ├── loadtest/
 │   ├── README.md
-│   └── stress.js                 # Concurrent request generator
+│   ├── stress.js                 # Concurrent request generator
+│   └── ws-test.js                # WebSocket connectivity test
 ├── tui/
 │   ├── README.md
 │   ├── Makefile
@@ -421,9 +443,11 @@ event-platform-api/
 │   ├── INSTALL.md                # Initial bootstrap procedure
 │   ├── ARCHITECTURE.md           # Detailed design rationale
 │   ├── API.md                    # Complete API reference
-│   └── REVERSE_PROXY.md          # Nginx alternative deployment
+│   ├── REVERSE_PROXY.md          # Nginx alternative deployment
+│   └── REPLICATION.md            # Supabase replication guide
 ├── .github/
 │   └── workflows/ci.yml          # Compile + lint validation
+├── .dockerignore
 ├── .gitignore
 └── README.md                     # This file
 ```
