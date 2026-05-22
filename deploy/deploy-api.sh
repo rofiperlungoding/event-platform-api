@@ -58,11 +58,11 @@ sleep 2
 
 if curl -sf http://localhost:3099/health > /dev/null 2>&1; then
     echo "[$(date)] ✓ Smoke test passed" >> "$LOG"
-    kill -9 $TEST_PID 2>/dev/null
+    kill -9 $TEST_PID 2>/dev/null || true
     sleep 1
 else
     echo "[$(date)] ❌ SMOKE TEST FAILED — keeping old binary" >> "$LOG"
-    kill -9 $TEST_PID 2>/dev/null
+    kill -9 $TEST_PID 2>/dev/null || true
     rm -f event-server-staging
     exit 1
 fi
