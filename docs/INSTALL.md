@@ -69,6 +69,20 @@ STATIC_DIR=$HOME/projects/event-platform-api/console \
 
 `curl http://localhost:3001/health` should return `{"status":"ok"}`.
 
+### Optional environment variables
+
+| Variable        | Default                                  | Purpose                                  |
+| --------------- | ---------------------------------------- | ---------------------------------------- |
+| `CORS_ORIGINS`  | unset → `*` (development)                | Comma-separated list of allowed Origins. |
+| `ALLOWED_HOSTS` | unset → accept any                       | Comma-separated Host header allowlist.   |
+| `WORKERS`       | `8`                                      | Pre-fork pool size; matches CPU count.   |
+
+For production the recommended values on the reference tablet are
+`CORS_ORIGINS=https://console.rofidoesthings.site` and
+`ALLOWED_HOSTS=api.rofidoesthings.site,localhost`. When `JWT_SECRET`
+is unset the server emits a `[WARN]` line at startup so the
+operator can spot the misconfiguration in the boot log.
+
 ## 4. Process supervision
 
 Install pm2 globally and register the API:

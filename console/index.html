@@ -8,43 +8,48 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" />
-<link rel="stylesheet" href="./styles.css?v=6" />
+<link rel="stylesheet" href="./styles.css?v=7" />
 </head>
 <body>
-  <aside class="sidebar">
+  <noscript>
+    <div style="padding:16px;background:#fff3cd;color:#856404;border-bottom:1px solid #ffeaa7">
+      This dashboard requires JavaScript. Please enable it in your browser to view live metrics.
+    </div>
+  </noscript>
+  <aside class="sidebar" role="navigation" aria-label="Console navigation">
     <div class="brand">
-      <div class="brand-logo">EP</div>
+      <div class="brand-logo" aria-hidden="true">EP</div>
       <div class="brand-meta">
         <div class="brand-name">Event Platform</div>
         <div class="brand-env" id="brand-env">PRODUCTION</div>
       </div>
     </div>
 
-    <nav class="nav">
+    <nav class="nav" aria-label="Main sections">
       <div class="nav-group-label">Operations</div>
-      <a class="nav-item active" data-tab="overview">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+      <a class="nav-item active" data-tab="overview" role="tab" aria-selected="true">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
         Overview
       </a>
-      <a class="nav-item" data-tab="system">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+      <a class="nav-item" data-tab="system" role="tab" aria-selected="false">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
         System
       </a>
 
       <div class="nav-group-label">Data</div>
-      <a class="nav-item" data-tab="database">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></svg>
+      <a class="nav-item" data-tab="database" role="tab" aria-selected="false">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></svg>
         Database
       </a>
-      <a class="nav-item" data-tab="participants">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      <a class="nav-item" data-tab="participants" role="tab" aria-selected="false">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         Participants
       </a>
     </nav>
 
     <div class="sidebar-footer">
-      <div class="status-pill" id="status-pill">
-        <span class="status-dot connecting" id="status-dot"></span>
+      <div class="status-pill" id="status-pill" role="status" aria-live="polite">
+        <span class="status-dot connecting" id="status-dot" aria-hidden="true"></span>
         <span id="status-text">Connecting…</span>
       </div>
       <div class="endpoint" id="endpoint-text">api.rofidoesthings.site</div>
@@ -56,15 +61,15 @@
       <div class="topbar-left">
         <h1 id="page-title">Overview</h1>
         <div class="chips" id="region-chips">
-          <span class="chip region"><span class="chip-dot"></span>tabserve</span>
+          <span class="chip region"><span class="chip-dot" aria-hidden="true"></span>tabserve</span>
           <span class="chip platform">android</span>
           <span class="chip arch">arm64</span>
         </div>
       </div>
       <div class="topbar-right">
-        <span class="last-update" id="last-update">—</span>
-        <button class="btn-refresh" id="btn-refresh" title="Refresh now">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 4 21 10 15 10"/></svg>
+        <span class="last-update" id="last-update" aria-live="polite">—</span>
+        <button class="btn-refresh" id="btn-refresh" type="button" aria-label="Refresh dashboard now" title="Refresh now">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 4 21 10 15 10"/></svg>
           Refresh
         </button>
       </div>

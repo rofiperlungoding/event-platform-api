@@ -248,9 +248,109 @@ responsive even with a large participant set.
 ]
 ```
 
+### `GET /participants/:id`
+
+Single participant lookup. Read-only.
+
+**Response**
+```json
+{
+  "id": 7,
+  "name": "Alice Doe",
+  "email": "alice@example.com",
+  "team": "Alpha",
+  "role": "participant",
+  "createdAt": "2026-05-21 15:38:45.559"
+}
+```
+
+**Errors**
+- `404` — Participant id does not exist
+
+### `DELETE /participants/:id`
+
+Permanently remove a participant and cascade-delete their attendance,
+device bindings, and audit log references. **Administrator access
+required** (round 4 closed the previously-unauthenticated path).
+
+**Headers** — `Authorization: Bearer <admin-token>`
+
+**Response** — `204 No Content`
+
+**Errors**
+- `401` — Missing or invalid admin token
+- `403` — Token role is not `admin`
+- `404` — Participant id does not exist
+
+Every successful DELETE writes an `AuditLog` row with action
+`participant.delete` and the actor email for traceability.
+
+### `GET /metrics`
+
+Prometheus-format counters. Intended for the `health-watchdog`
+script and any external monitoring agent that scrapes the tablet.
+
+**Response** — `text/plain; version=0.0.4`
+```
+# HELP eventplatform_requests_total Total HTTP requests handled.
+# TYPE eventplatform_requests_total counter
+eventplatform_requests_total 12345
+# HELP eventplatform_requests_5xx Total 5xx responses returned.
+eventplatform_requests_5xx 0
+# HELP eventplatform_requests_4xx Total 4xx responses returned.
+eventplatform_requests_4xx 12
+# HELP eventplatform_db_errors Database operation errors.
+eventplatform_db_errors 0
+# HELP eventplatform_checkins_ok Attendance check-ins committed.
+eventplatform_checkins_ok 1850
+# HELP eventplatform_checkins_duplicate Duplicate attempts.
+eventplatform_checkins_duplicate 4
+# HELP eventplatform_uptime_seconds Process uptime since last restart.
+eventplatform_uptime_seconds 3600
+# HELP eventplatform_service_uptime_seconds Service uptime since first ever boot.
+eventplatform_service_uptime_seconds 1296000
+```
+
+Counters live in shared memory across the worker pool (round 6
+hardening), so any worker that handles `/metrics` returns the
+pool-wide aggregate.
+
 ---
 
 ## Authentication
+
+### `POST /register`
+
+**Legacy endpoint, no authentication required.** Creates a
+participant record with name, email, and team but no password
+or role. Retained for backward compatibility with bulk import
+scripts that pre-date the auth flow; new clients should use
+`POST /auth/register` instead.
+
+**Request Body**
+```json
+{
+  "name": "Alice Doe",
+  "email": "alice@example.com",
+  "team": "Alpha"
+}
+```
+
+**Response — 201 Created**
+```json
+{
+  "id": 7,
+  "name": "Alice Doe",
+  "email": "alice@example.com",
+  "team": "Alpha",
+  "createdAt": "2026-05-23 12:00:00",
+  "updatedAt": "2026-05-23 12:00:00"
+}
+```
+
+**Errors**
+- `400` — Missing `name`, `email`, or `team`
+- `409` — Email already registered
 
 ### `POST /auth/register`
 
@@ -372,6 +472,40 @@ Used by the operational dashboard to surface "who did what when".
 ]
 ```
 
+### `POST /admin/reset-participant`
+
+Administrator-initiated password / email reset for a single
+participant. Either field is optional; at least one must be
+present. The action is recorded in `AuditLog` with action
+`participant.reset` and a metadata blob describing which fields
+changed.
+
+**Headers** — `Authorization: Bearer <admin-token>`
+
+**Request Body**
+```json
+{
+  "participant_id": "42",
+  "new_password": "newSecret123",
+  "new_email": "alice2@example.com"
+}
+```
+
+`new_password` is hashed via PBKDF2-HMAC-SHA-256 server-side
+before storage.
+
+**Response — 200 OK**
+```json
+{ "ok": true, "updated": ["password", "email"] }
+```
+
+**Errors**
+- `400` — neither `new_password` nor `new_email` was supplied
+- `401` — Missing token
+- `403` — Token role is not `admin`
+- `404` — `participant_id` not found
+- `409` — `new_email` collides with an existing participant
+
 ### `GET /health/ready`
 
 Readiness probe. Returns `200 OK` while the worker is healthy and
@@ -490,6 +624,68 @@ QR display) and extend `expires_at` by 30 seconds.
   "expires_at": "2026-05-22 08:30:30"
 }
 ```
+
+---
+
+## Events
+
+Events are top-level containers for sessions. The current
+deployment uses a single implicit event and the endpoints below
+exist for multi-event use cases (a campus running back-to-back
+trainings from the same tablet, for instance).
+
+### `GET /events`
+
+List all events ordered by `starts_at` descending.
+
+**Response**
+```json
+[
+  {
+    "id": 1,
+    "slug": "intrivia-2026",
+    "name": "Intrivia 2026",
+    "description": "Annual campus event",
+    "starts_at": "2026-09-15 08:00:00",
+    "ends_at":   "2026-09-15 17:00:00",
+    "createdAt": "2026-05-23 12:00:00"
+  }
+]
+```
+
+### `POST /events`
+
+Create a new event. **Administrator access required.**
+
+**Headers** — `Authorization: Bearer <admin-token>`
+
+**Request Body**
+```json
+{
+  "slug": "intrivia-2026",
+  "name": "Intrivia 2026",
+  "description": "Annual campus event",
+  "starts_at": "2026-09-15 08:00:00",
+  "ends_at":   "2026-09-15 17:00:00"
+}
+```
+
+`description`, `starts_at`, and `ends_at` are optional. `slug` and
+`name` are required.
+
+**Response — 201 Created**
+```json
+{
+  "id": 1,
+  "slug": "intrivia-2026",
+  "name": "Intrivia 2026"
+}
+```
+
+**Errors**
+- `400` — Missing `slug` or `name`
+- `401` / `403` — Authentication failure
+- `409` — `slug` already exists
 
 ---
 

@@ -80,7 +80,13 @@ async function fetchJson(path, opts = {}) {
 $$('.nav-item').forEach((el) => {
   el.addEventListener('click', () => {
     const tab = el.dataset.tab;
-    $$('.nav-item').forEach((n) => n.classList.toggle('active', n === el));
+    $$('.nav-item').forEach((n) => {
+      const isActive = n === el;
+      n.classList.toggle('active', isActive);
+      /* Round 12 a11y: keep aria-selected in sync so screen readers
+       * announce the right tab on switch. */
+      n.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    });
     $$('.tab-panel').forEach((p) =>
       p.classList.toggle('active', p.id === `tab-${tab}`),
     );

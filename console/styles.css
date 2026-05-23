@@ -550,3 +550,33 @@ code { font-family: var(--mono); font-size: 0.92em; }
   border-radius: var(--radius);
   margin: 8px;
 }
+
+
+/* ════════════════════════════════════════════════════════════════════
+ * Round 12 — accessibility focus rings
+ *
+ * Every interactive element gets a visible focus indicator when
+ * navigated via keyboard. `:focus-visible` keeps the ring out of the
+ * way for mouse users while still meeting WCAG 2.4.7. */
+:focus-visible {
+  outline: 2px solid var(--border-focus, #FF9900);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+.btn-refresh:focus-visible,
+.nav-item:focus-visible {
+  outline-offset: 3px;
+}
+.btn-del:focus-visible {
+  outline-color: #d13212;
+}
+
+/* Respect users who prefer reduced motion — disables shimmer skeletons
+ * and the spinner that ships with .refreshing. WCAG 2.3.3. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

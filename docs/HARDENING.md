@@ -1601,3 +1601,109 @@ fresh installs that haven't applied 005 yet via `IF EXISTS` guards.
 | status-check.sh JSON valid              | Inject `\` into a log line, run script, `jq .`       |
 | wipe-all.sql full coverage              | After R5 migrations, run wipe-all → SELECT count(*) on AuditLog, RevokedToken returns 0 |
 | WS child libpq independence             | `psql 'SELECT pid, application_name FROM pg_stat_activity'` → distinct pids per active WS |
+
+
+---
+
+# Round 12 — API Coverage, Doc Drift, A11y
+
+Round 12 closes the documentation loop and adds basic
+accessibility primitives to the admin console.
+
+## Summary
+
+| #   | Area      | Risk                                                    | Status     |
+| --- | --------- | ------------------------------------------------------- | ---------- |
+| 299 | Docs      | API.md missing `POST /register` (legacy)                | Mitigated  |
+| 300 | Docs      | API.md missing `GET /metrics`                           | Mitigated  |
+| 301 | Docs      | API.md missing `GET /participants/:id`                  | Mitigated  |
+| 302 | Docs      | API.md missing `DELETE /participants/:id`               | Mitigated  |
+| 303 | Docs      | API.md missing `POST /admin/reset-participant`          | Mitigated  |
+| 304 | Docs      | API.md missing `GET /events`, `POST /events`            | Mitigated  |
+| 305 | Docs      | INSTALL.md missing CORS_ORIGINS / ALLOWED_HOSTS / WORKERS | Mitigated  |
+| 306 | Console   | Sidebar nav has no `role` / `aria-label`                | Mitigated  |
+| 307 | Console   | SVG icons missing `aria-hidden`                         | Mitigated  |
+| 308 | Console   | Tab `aria-selected` not toggled                         | Mitigated  |
+| 309 | Console   | Refresh button missing `aria-label`                     | Mitigated  |
+| 310 | Console   | No `:focus-visible` ring                                | Mitigated  |
+| 311 | Console   | No `prefers-reduced-motion` opt-out                     | Mitigated  |
+| 312 | Console   | No `<noscript>` fallback                                | Mitigated  |
+| 313 | Console   | Status pill missing `role="status"` aria-live           | Mitigated  |
+
+## Mitigations Detail (Round 12)
+
+### 299. `POST /register` legacy
+
+Mitigated. API.md now documents the legacy unauthenticated
+endpoint (retained for backward compatibility with bulk-import
+scripts that pre-date the auth flow) so operators understand its
+role vs `/auth/register`.
+
+### 300. `/metrics` documented
+
+Mitigated. New section under Diagnostics describes the Prometheus
+counter exposition format, including a representative sample
+output and a note that the counters are now shared across the
+worker pool (round 6).
+
+### 301, 302. `/participants/:id` GET/DELETE
+
+Mitigated. Both endpoints are documented with auth requirements,
+response shapes, and the audit-log behaviour for DELETE
+(actor-attributed `participant.delete` action).
+
+### 303. `/admin/reset-participant`
+
+Mitigated. Documented with the request body shape, the at-least-
+one-of constraint between `new_password` and `new_email`, and
+the audit-log entry produced.
+
+### 304. Events section
+
+Mitigated. New top-level Events section in API.md describing
+both `GET /events` and `POST /events`. Useful for multi-event
+tablet deployments (e.g., back-to-back trainings).
+
+### 305. INSTALL.md env vars
+
+Mitigated. New table covering the three optional production
+environment variables (`CORS_ORIGINS`, `ALLOWED_HOSTS`,
+`WORKERS`) with the reference values for the production tablet.
+Also notes the `[WARN]` startup line when `JWT_SECRET` is unset.
+
+### 306–313. Console accessibility
+
+Mitigated. The dashboard now meets the basics of WCAG 2.4.3
+(focus order), 2.4.7 (focus visible), 2.3.3 (prefers-reduced-
+motion respected), 4.1.2 (name/role/value):
+
+- `<aside role="navigation" aria-label="Console navigation">`
+- `<nav aria-label="Main sections">`
+- All decorative SVG icons carry `aria-hidden="true"
+  focusable="false"`.
+- Tab items have `role="tab"` and `aria-selected` is toggled by
+  app.js on switch.
+- The status pill lives in `role="status" aria-live="polite"` so
+  screen readers announce connection state changes.
+- The refresh button has `type="button"` and a contextual
+  `aria-label`.
+- A `:focus-visible` outline ring is defined globally with an
+  AWS-orange accent and a tighter offset for nav items.
+- `@media (prefers-reduced-motion: reduce)` neutralises shimmer
+  skeletons and the rotating refresh spinner.
+- A `<noscript>` banner explains the JS dependency for users
+  who landed with scripting disabled.
+
+CSS bumped to `?v=7` so the cache picks up the new focus
+outline rules.
+
+## Verification Matrix (Round 12)
+
+| Capability                              | Test                                                       |
+| --------------------------------------- | ---------------------------------------------------------- |
+| API.md endpoint coverage                | `grep -E '^### \\\`[A-Z]+ /' docs/API.md \| wc -l` matches the strcmp router count |
+| INSTALL.md env section                  | `grep -E 'CORS_ORIGINS\|ALLOWED_HOSTS\|WORKERS' docs/INSTALL.md` returns ≥ 3 lines |
+| Console focus visible                   | Tab through dashboard with keyboard → orange outline ring  |
+| Console aria-selected sync              | Click "System" tab, inspect `[role="tab"][aria-selected="true"]` |
+| Console reduced motion                  | DevTools → emulate prefers-reduced-motion → shimmer stops  |
+| Console noscript banner                 | Disable JS in DevTools → yellow banner visible             |
