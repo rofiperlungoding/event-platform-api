@@ -1,5 +1,5 @@
 /* Service Worker — offline-first + background sync */
-const CACHE_NAME = 'checkin-v2';
+const CACHE_NAME = 'checkin-v3';
 const STATIC_ASSETS = [
   '/attend/scan.html',
   '/attend/manifest.json',

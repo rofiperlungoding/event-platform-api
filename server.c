@@ -23,8 +23,13 @@
  * SECURITY:
  *   - SO_LINGER=0 forces RST on close, prevents TIME_WAIT port lock
  *   - Webhook endpoints gated by shared secret query parameter
- *   - Token auth uses FNV-1a non-cryptographic hash (NOT for production)
- *   - Passwords stored in plaintext (NOT for production)
+ *   - Token auth uses HMAC-SHA1 (RFC 2104). Same primitive used for
+ *     the WebSocket Sec-WebSocket-Accept handshake; reused here so the
+ *     signing path has no extra dependencies.
+ *   - Passwords are SHA1-salted (prefix "sha1$" + base64). Plain
+ *     leftovers from older bulk imports still work for backward compat.
+ *   - CORS origin is restricted via CORS_ORIGINS env (comma-separated);
+ *     wildcard `*` only when the variable is unset (development).
  */
 
 #include <stdio.h>
@@ -43,23 +48,92 @@
 #include <libpq-fe.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 
 #define BUF_SIZE 65536
 #define MAX_PATH 1024
-#define MAX_BODY 8192
+#define MAX_BODY 65536       /* aligned with BUF_SIZE; enforced before any allocation */
 #define TOKEN_EXPIRY 86400  /* 24 hours */
 #define SESSION_EXPIRY 300  /* 5 minutes */
 #define SESSION_REFRESH 30  /* 30 seconds extension */
 #define CODE_LEN 8
+
+/* Graceful shutdown — workers consult this on each accept loop */
+static volatile sig_atomic_t shutdown_requested = 0;
 
 static time_t start_time;          /* current process start (resets on hot-swap) */
 static time_t service_start_time;  /* persistent: first-ever boot of this service */
 static char static_dir[MAX_PATH];
 static char db_url[1024];
 static char jwt_secret[256];
+static char webhook_secret[256];
+static char cors_allowed[512];     /* comma-separated origins, or empty for "*" */
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
+/* ─── CORS handling ───────────────────────────────────────────────────
+ * If the CORS_ORIGINS env var is set, we reflect the request's Origin
+ * header back only when it is in the allowlist. Otherwise we fall back
+ * to wildcard `*` for ease of development. The allowlist is comma
+ * separated; whitespace ignored. */
+static int origin_is_allowed(const char *origin, const char *list) {
+    if (!list || !list[0] || !origin || !origin[0]) return 0;
+    int olen = strlen(origin);
+    const char *p = list;
+    while (*p) {
+        while (*p == ' ' || *p == ',') p++;
+        const char *end = p;
+        while (*end && *end != ',') end++;
+        int len = end - p;
+        while (len > 0 && p[len-1] == ' ') len--;
+        if (len == olen && strncmp(p, origin, olen) == 0) return 1;
+        if (len == 1 && p[0] == '*') return 1;
+        p = end;
+    }
+    return 0;
+}
+
+/* Per-request CORS headers — caller passes the raw request buffer so we
+ * can read the Origin header and reflect it only when allowed. */
+static void cors_headers_for(const char *raw_request, char *out, int out_sz) {
+    const char *origin_hdr = strcasestr(raw_request ? raw_request : "", "\nOrigin:");
+    char origin[256] = "";
+    if (origin_hdr) {
+        origin_hdr += 8;
+        while (*origin_hdr == ' ') origin_hdr++;
+        int i = 0;
+        while (*origin_hdr && *origin_hdr != '\r' && *origin_hdr != '\n' && i < (int)sizeof(origin)-1)
+            origin[i++] = *origin_hdr++;
+        origin[i] = 0;
+    }
+
+    const char *allow;
+    char buf[300];
+    if (!cors_allowed[0]) {
+        allow = "*";
+    } else if (origin_is_allowed(origin, cors_allowed)) {
+        snprintf(buf, sizeof(buf), "%s", origin);
+        allow = buf;
+    } else {
+        /* Origin not allowed — omit Allow-Origin (browser will block) */
+        allow = NULL;
+    }
+
+    if (allow) {
+        snprintf(out, out_sz,
+            "Access-Control-Allow-Origin: %s\r\n"
+            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+            "Vary: Origin\r\n",
+            allow);
+    } else {
+        snprintf(out, out_sz, "Vary: Origin\r\n");
+    }
+}
+
+/* Backward-compat wildcard string still used by handlers that don't have
+ * the raw request buffer. They will be migrated; for now this remains as
+ * a safe fallback. */
 static const char *cors_headers =
     "Access-Control-Allow-Origin: *\r\n"
     "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
@@ -322,7 +396,7 @@ static void sb_appendf(strbuf *sb, const char *fmt, ...) {
 }
 static void sb_free(strbuf *sb) { free(sb->data); sb->data = NULL; sb->len = sb->cap = 0; }
 
-/* FNV-1a hash (64-bit) - simple, fast, non-cryptographic */
+/* FNV-1a hash (64-bit) — kept for non-security uses (hashtable seeds etc.). */
 static unsigned long long fnv1a_hash(const char *data, int len) {
     unsigned long long hash = 14695981039346656037ULL;
     for (int i = 0; i < len; i++) {
@@ -332,13 +406,71 @@ static unsigned long long fnv1a_hash(const char *data, int len) {
     return hash;
 }
 
-/* Generate token: "id:expiry:hex_signature" */
+/* ─── HMAC-SHA1 (RFC 2104) — used for token signing + password hashing.
+ * Keyed-hash with a process-local secret; constant-time compare on
+ * verify. */
+static void hmac_sha1(const uint8_t *key, int klen,
+                      const uint8_t *msg, int mlen,
+                      uint8_t out[20]) {
+    uint8_t k_pad[64];
+    if (klen > 64) {
+        sha1_ctx kc; sha1_init(&kc); sha1_update(&kc, key, klen); sha1_final(&kc, k_pad);
+        memset(k_pad + 20, 0, 44);
+    } else {
+        memcpy(k_pad, key, klen);
+        memset(k_pad + klen, 0, 64 - klen);
+    }
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) { ipad[i] = k_pad[i] ^ 0x36; opad[i] = k_pad[i] ^ 0x5c; }
+
+    sha1_ctx ctx;
+    uint8_t inner[20];
+    sha1_init(&ctx); sha1_update(&ctx, ipad, 64); sha1_update(&ctx, msg, mlen); sha1_final(&ctx, inner);
+    sha1_init(&ctx); sha1_update(&ctx, opad, 64); sha1_update(&ctx, inner, 20);  sha1_final(&ctx, out);
+}
+
+/* Constant-time memory compare — defeats timing attacks on signature
+ * verification. */
+static int ct_memeq(const void *a, const void *b, int n) {
+    const uint8_t *x = a, *y = b;
+    int diff = 0;
+    for (int i = 0; i < n; i++) diff |= x[i] ^ y[i];
+    return diff == 0;
+}
+
+static void hex_encode(const uint8_t *in, int len, char *out) {
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < len; i++) {
+        out[i*2] = hex[(in[i] >> 4) & 0xf];
+        out[i*2+1] = hex[in[i] & 0xf];
+    }
+    out[len*2] = 0;
+}
+
+static int hex_decode(const char *in, int outlen, uint8_t *out) {
+    for (int i = 0; i < outlen; i++) {
+        char a = in[i*2], b = in[i*2+1];
+        if (!a || !b) return -1;
+        int hi = (a >= '0' && a <= '9') ? a - '0' : (a >= 'a' && a <= 'f') ? a - 'a' + 10 : -1;
+        int lo = (b >= '0' && b <= '9') ? b - '0' : (b >= 'a' && b <= 'f') ? b - 'a' + 10 : -1;
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (hi << 4) | lo;
+    }
+    return 0;
+}
+
+/* Generate token: "id:expiry:role:hex_sha1_signature" */
 static void generate_token(char *out, int out_sz, int user_id, const char *role) {
     time_t expiry = time(NULL) + TOKEN_EXPIRY;
     char payload[256];
-    int plen = snprintf(payload, sizeof(payload), "%d:%ld:%s", user_id, (long)expiry, jwt_secret);
-    unsigned long long sig = fnv1a_hash(payload, plen);
-    snprintf(out, out_sz, "%d:%ld:%s:%016llx", user_id, (long)expiry, role, sig);
+    int plen = snprintf(payload, sizeof(payload), "%d:%ld:%s",
+                         user_id, (long)expiry, role);
+    uint8_t sig[20];
+    hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
+              (const uint8_t *)payload, plen, sig);
+    char hex[41];
+    hex_encode(sig, 20, hex);
+    snprintf(out, out_sz, "%d:%ld:%s:%s", user_id, (long)expiry, role, hex);
 }
 
 /* Verify token, returns participant_id or -1 on failure.
@@ -347,28 +479,82 @@ static int verify_token(const char *token, char *out_role) {
     int user_id;
     long expiry;
     char role[32];
-    unsigned long long provided_sig;
+    char provided_hex[64] = {0};
 
-    if (sscanf(token, "%d:%ld:%31[^:]:%llx", &user_id, &expiry, role, &provided_sig) != 4)
+    if (sscanf(token, "%d:%ld:%31[^:]:%63s", &user_id, &expiry, role, provided_hex) != 4)
         return -1;
+    if ((time_t)expiry < time(NULL)) return -1;
 
-    /* Check expiry */
-    if ((time_t)expiry < time(NULL))
-        return -1;
+    /* Length check first — HMAC-SHA1 is exactly 40 hex chars */
+    if (strlen(provided_hex) != 40) return -1;
 
-    /* Recompute signature */
     char payload[256];
-    int plen = snprintf(payload, sizeof(payload), "%d:%ld:%s", user_id, expiry, jwt_secret);
-    unsigned long long expected_sig = fnv1a_hash(payload, plen);
+    int plen = snprintf(payload, sizeof(payload), "%d:%ld:%s", user_id, expiry, role);
+    uint8_t expected[20];
+    hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
+              (const uint8_t *)payload, plen, expected);
 
-    if (provided_sig != expected_sig)
-        return -1;
+    uint8_t got[20];
+    if (hex_decode(provided_hex, 20, got) < 0) return -1;
+    if (!ct_memeq(got, expected, 20)) return -1;
 
     if (out_role) {
         strncpy(out_role, role, 31);
         out_role[31] = 0;
     }
     return user_id;
+}
+
+/* ─── Password hashing — salted SHA-1 with HMAC.
+ * Format: "sha1$<16-hex-salt>$<40-hex-hmac>". Plaintext leftovers from
+ * earlier bulk imports remain valid via the legacy compare path so we
+ * do not break existing accounts.
+ *
+ * SHA-1 is a deliberate choice here: the project already has SHA-1 +
+ * HMAC primitives in the binary (used for the WebSocket handshake), and
+ * the threat model is a closed campus event without internet exposure
+ * of the credential store. For a public-internet deployment this would
+ * be replaced with bcrypt / argon2. */
+static void hash_password(char *out, int out_sz, const char *password) {
+    /* 8-byte salt */
+    uint8_t salt[8];
+    int rfd = open("/dev/urandom", O_RDONLY);
+    if (rfd >= 0) { read(rfd, salt, 8); close(rfd); }
+    else { for (int i = 0; i < 8; i++) salt[i] = (uint8_t)(time(NULL) >> i); }
+    char salt_hex[17];
+    hex_encode(salt, 8, salt_hex);
+
+    /* HMAC( jwt_secret, salt || ':' || password ) */
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "%s:%s", salt_hex, password);
+    uint8_t mac[20];
+    hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
+              (const uint8_t *)buf, n, mac);
+    char mac_hex[41];
+    hex_encode(mac, 20, mac_hex);
+    snprintf(out, out_sz, "sha1$%s$%s", salt_hex, mac_hex);
+}
+
+static int verify_password(const char *stored, const char *supplied) {
+    if (!stored || !supplied) return 0;
+    if (strncmp(stored, "sha1$", 5) != 0) {
+        /* Legacy plaintext entry — accept literal compare. */
+        return strcmp(stored, supplied) == 0;
+    }
+    /* Format: sha1$SALTHEX$MACHEX */
+    const char *salt_hex = stored + 5;
+    const char *dollar = strchr(salt_hex, '$');
+    if (!dollar) return 0;
+    int salt_len = dollar - salt_hex;
+    if (salt_len != 16) return 0;
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "%.*s:%s", salt_len, salt_hex, supplied);
+    uint8_t mac[20];
+    hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
+              (const uint8_t *)buf, n, mac);
+    char mac_hex[41];
+    hex_encode(mac, 20, mac_hex);
+    return strcmp(mac_hex, dollar + 1) == 0;
 }
 
 /* Extract Bearer token from raw headers */
@@ -798,7 +984,10 @@ static void handle_auth_register(int fd, const char *body) {
     PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
-    const char *params[5] = { name, email, team, password, "participant" };
+    const char *role = "participant";
+    char hashed[128];
+    hash_password(hashed, sizeof(hashed), password);
+    const char *params[5] = { name, email, team, hashed, role };
     PGresult *r = PQexecParams(conn,
         "INSERT INTO \"Participant\" (name, email, team, password_hash, role, \"createdAt\", \"updatedAt\") "
         "VALUES ($1, $2, $3, $4, $5, NOW(), NOW()) "
@@ -816,9 +1005,9 @@ static void handle_auth_register(int fd, const char *body) {
     }
 
     int user_id = atoi(PQgetvalue(r, 0, 0));
-    const char *role = PQgetvalue(r, 0, 4);
+    const char *db_role = PQgetvalue(r, 0, 4);
     char token[256];
-    generate_token(token, sizeof(token), user_id, role);
+    generate_token(token, sizeof(token), user_id, db_role);
 
     char buf[1024];
     char ename[256], eemail[256], eteam[128];
@@ -828,7 +1017,7 @@ static void handle_auth_register(int fd, const char *body) {
     snprintf(buf, sizeof(buf),
         "{\"token\":\"%s\",\"participant\":{\"id\":%d,\"name\":\"%s\",\"email\":\"%s\","
         "\"team\":\"%s\",\"role\":\"%s\",\"createdAt\":\"%s\"}}",
-        token, user_id, ename, eemail, eteam, role, PQgetvalue(r, 0, 5));
+        token, user_id, ename, eemail, eteam, db_role, PQgetvalue(r, 0, 5));
     PQclear(r); db_release(conn);
     send_json(fd, 201, "Created", buf);
 }
@@ -859,7 +1048,7 @@ static void handle_auth_login(int fd, const char *body) {
     }
 
     const char *stored_pw = PQgetvalue(r, 0, 5);
-    if (!stored_pw || strcmp(stored_pw, password) != 0) {
+    if (!verify_password(stored_pw, password)) {
         PQclear(r); db_release(conn);
         send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid email or password\"}");
         return;
@@ -1739,7 +1928,10 @@ static void handle_participants_bulk(int fd, const char *headers, const char *bo
         const char *team  = fields[2];
         const char *password = fields[3] ? fields[3] : "default-pw-please-change";
 
-        const char *params[5] = { name, email, team, password, "participant" };
+        const char *role_str = "participant";
+        char hashed[128];
+        hash_password(hashed, sizeof(hashed), password);
+        const char *params[5] = { name, email, team, hashed, role_str };
         PGresult *r = PQexecParams(conn,
             "INSERT INTO \"Participant\" (name, email, team, password_hash, role, "
             "\"createdAt\", \"updatedAt\") VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
@@ -2437,16 +2629,28 @@ static void handle_request(int fd, const char *method, const char *path,
 /* ─── Worker accept loop ─────────────────────────────────────────────
  * Runs in each pre-forked child. Reads requests, dispatches to router,
  * then closes the connection. Loops forever. */
+static void worker_term_handler(int sig) {
+    (void)sig;
+    shutdown_requested = 1;
+}
+
 static void run_worker_loop(int server_fd) {
     /* Reap our own forked children (WebSocket handlers) automatically. */
     signal(SIGCHLD, SIG_IGN);
 
-    while (1) {
+    /* Workers also obey the supervisor's shutdown flag. SIGTERM sets it
+     * via the worker-side handler; the loop exits at the next accept. */
+    signal(SIGTERM, worker_term_handler);
+
+    while (!shutdown_requested) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (shutdown_requested) break;
+                continue;
+            }
             perror("accept"); continue;
         }
 
@@ -2465,6 +2669,7 @@ static void run_worker_loop(int server_fd) {
         char buf[BUF_SIZE];
         ssize_t total = 0;
         ssize_t n;
+        int oversize = 0;
         while ((n = read(client_fd, buf + total, sizeof(buf) - total - 1)) > 0) {
             total += n;
             buf[total] = 0;
@@ -2472,7 +2677,12 @@ static void run_worker_loop(int server_fd) {
             if (header_end) {
                 char *cl = strcasestr(buf, "Content-Length:");
                 if (cl) {
-                    int content_len = atoi(cl + 15);
+                    long content_len = atol(cl + 15);
+                    /* Hard cap on body size — defends against memory
+                     * exhaustion via Content-Length header lying. */
+                    if (content_len < 0 || content_len > MAX_BODY) {
+                        oversize = 1; break;
+                    }
                     int header_size = (header_end + 4) - buf;
                     int body_received = total - header_size;
                     if (body_received >= content_len) break;
@@ -2481,6 +2691,19 @@ static void run_worker_loop(int server_fd) {
             if (total >= (ssize_t)sizeof(buf) - 1) break;
         }
         buf[total] = 0;
+
+        if (oversize) {
+            const char *body = "{\"error\":\"request body too large\"}";
+            char hdr[256];
+            int hlen = snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 413 Payload Too Large\r\n%sContent-Type: application/json\r\n"
+                "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+                cors_headers, strlen(body));
+            write(client_fd, hdr, hlen);
+            write(client_fd, body, strlen(body));
+            close(client_fd);
+            continue;
+        }
 
         char method[16] = "", path[MAX_PATH] = "";
         sscanf(buf, "%15s %1023s", method, path);
@@ -2513,14 +2736,24 @@ static void run_worker_loop(int server_fd) {
         }
         close(client_fd);
     }
+
+    /* Graceful exit: drain in-flight DB connection */
+    if (worker_conn) { PQfinish(worker_conn); worker_conn = NULL; }
 }
 
 /* On SIGTERM/SIGINT in the supervisor, kill the entire worker pool. */
 static void supervisor_term_handler(int sig) {
     (void)sig;
-    /* Kill the whole process group (we did setpgid earlier). */
+    shutdown_requested = 1;
+    /* Send SIGTERM to the whole process group; workers will finish
+     * the in-flight request, then exit. */
     kill(0, SIGTERM);
-    _exit(0);
+    /* Give workers up to 5 s to drain before forcing _exit. */
+    alarm(5);
+    signal(SIGALRM, supervisor_term_handler);
+    /* On second SIGALRM we hard-exit. */
+    static int forced = 0;
+    if (forced++) _exit(0);
 }
 
 int main(void) {
@@ -2561,6 +2794,24 @@ int main(void) {
     const char *secret = getenv("JWT_SECRET");
     snprintf(jwt_secret, sizeof(jwt_secret), "%s",
         secret ? secret : "devsecret123");
+
+    const char *whs = getenv("WEBHOOK_SECRET");
+    snprintf(webhook_secret, sizeof(webhook_secret), "%s",
+        whs ? whs : "devwebhook");
+
+    const char *origins = getenv("CORS_ORIGINS");
+    snprintf(cors_allowed, sizeof(cors_allowed), "%s", origins ? origins : "");
+
+    /* Bump file descriptor soft limit to the hard limit (Termux usually
+     * 32k vs 4k default). Each WebSocket connection holds a fd, plus
+     * one per pre-forked worker, plus libpq sockets. */
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }

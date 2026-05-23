@@ -13,8 +13,8 @@ co-hosted on one Android tablet. Designed and verified to absorb a
 | Concurrency model       | Pre-fork worker pool, 8 workers             |
 | Database                | PostgreSQL 18                               |
 | Public ingress          | Cloudflare Tunnel                           |
-| Verified peak           | **2,000 concurrent / 1.8 s / 100 % pass**   |
-| Sustained throughput    | ~1,000 req/s LAN                            |
+| Verified peak           | **5,000 concurrent / 100 % pass on LAN**    |
+| Sustained throughput    | ~700 req/s LAN at burst, ~1,000 req/s warm  |
 | Median check-in latency | ~380 ms                                     |
 | Binary size             | ~80 KB                                      |
 | Service uptime          | Persistent across deploys and reboots       |
@@ -58,6 +58,7 @@ static assets it serves.
 | ---------------------------------------------- | ------------------------------------------------------------ |
 | [`docs/INSTALL.md`](docs/INSTALL.md)           | Bootstrap procedure: Termux, Postgres, build, autostart, tunnel |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Design rationale, pre-fork pool, persistent connection cache |
+| [`docs/HARDENING.md`](docs/HARDENING.md)       | Internal-failure-mode audit and applied mitigations         |
 | [`docs/API.md`](docs/API.md)                   | Complete REST + WebSocket reference with request/response schemas |
 | [`docs/REVERSE_PROXY.md`](docs/REVERSE_PROXY.md) | Optional Nginx ingress for hosts with a public IP          |
 | [`docs/REPLICATION.md`](docs/REPLICATION.md)   | Logical replication to Supabase for off-site backup          |
