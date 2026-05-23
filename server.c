@@ -182,6 +182,8 @@ static void send_response(int fd, int status, const char *status_text,
         "X-Content-Type-Options: nosniff\r\n"
         "X-Frame-Options: SAMEORIGIN\r\n"
         "Referrer-Policy: strict-origin-when-cross-origin\r\n"
+        "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
+        "Permissions-Policy: geolocation=(), microphone=(), camera=(self)\r\n"
         "Connection: close\r\n\r\n",
         status, status_text, cors_headers, content_type, body_len);
     write(fd, hdr, hlen);
@@ -1208,7 +1210,7 @@ static void handle_health_detailed(int fd) {
         "\"database\":{\"status\":\"%s\",\"latency_ms\":%ld}},"
         "\"uptime_seconds\":%ld,\"service_uptime_seconds\":%ld,"
         "\"deploy\":%s,\"backup\":%s,"
-        "\"version\":\"0.7.0-c\",\"node_version\":\"native-c\"}",
+        "\"version\":\"0.7.1-c\",\"node_version\":\"native-c\"}",
         overall, api_ms, db_status, db_ms,
         (long)(time(NULL) - start_time),
         (long)(time(NULL) - service_start_time),
@@ -4006,9 +4008,27 @@ int main(void) {
     }
     if (listen(server_fd, 16384) < 0) { perror("listen"); return 1; }
 
-    printf("event-server v0.7.0-c listening on 0.0.0.0:%d\n", port);
+    printf("event-server v0.7.1-c listening on 0.0.0.0:%d\n", port);
     printf("Static dir: %s\n", static_dir);
-    printf("Database: %s\n", db_url);
+    /* Round 8 fix (audit item 257): redact the password component of
+     * DATABASE_URL before logging. The conninfo is of the form
+     * `postgresql://user:password@host:port/db`; we mask everything
+     * between the first `:` after `//` and the next `@`. */
+    {
+        char redacted[1024];
+        snprintf(redacted, sizeof(redacted), "%s", db_url);
+        char *scheme_end = strstr(redacted, "://");
+        if (scheme_end) {
+            char *colon = strchr(scheme_end + 3, ':');
+            char *at = strchr(scheme_end + 3, '@');
+            if (colon && at && colon < at) {
+                /* Replace the password span with '***' */
+                memmove(colon + 4, at, strlen(at) + 1);
+                colon[1] = '*'; colon[2] = '*'; colon[3] = '*';
+            }
+        }
+        printf("Database: %s\n", redacted);
+    }
     printf("JWT Secret: %s\n", jwt_secret[0] ? "(set)" : "(default)");
 
 /* Pre-fork worker pool: N children share the listening socket.

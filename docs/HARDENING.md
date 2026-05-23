@@ -1256,3 +1256,89 @@ against thresholds.
 | `health-watchdog` /ready                | Stop Postgres; watchdog now triggers restart at next cron tick |
 | `rollback` skip-FAILED                  | Drop a `FAILED-*` archive; rollback selects the next one   |
 | `set -euo pipefail` adoption            | `grep -L 'set -euo pipefail' deploy/*.sh` should be empty   |
+
+
+---
+
+# Round 8 — Database, Headers, and Secret Hygiene
+
+Round 8 sweeps the remaining surfaces: SQL migration coverage,
+HTTP security headers, and secret material that was leaking
+through start-up logs.
+
+## Summary
+
+| #   | Area      | Risk                                                    | Status     |
+| --- | --------- | ------------------------------------------------------- | ---------- |
+| 251 | Schema    | `Participant.team` nullable but expected non-null        | Documented |
+| 252 | Schema    | Orphan device_ids in `Attendance` (no FK)               | Documented |
+| 253 | Schema    | `RevokedToken.sig_prefix CHAR(16)` collision space      | Documented |
+| 254 | Schema    | Missing `Attendance.checkedInAt` indexes                | Mitigated  |
+| 255 | Schema    | No EXPLAIN snapshot in repo for query plans             | Tracked    |
+| 256 | Loadtest  | Chaos test does not assert HTTP/2 keep-alive            | Tracked    |
+| 257 | Server    | DATABASE_URL printed with password in startup log       | Mitigated  |
+| 258 | Server    | Missing Permissions-Policy header                        | Mitigated  |
+| 259 | Server    | Missing Strict-Transport-Security header                 | Mitigated  |
+| 260 | Docs      | API.md drift                                             | Tracked    |
+
+## Mitigations Detail (Round 8)
+
+### 254. Attendance index coverage
+
+Mitigated by `migrations/006_round8_indexes.sql`. Three new btree
+indexes:
+
+* `idx_attendance_checkedinat` — recent-checkins ORDER BY DESC
+* `idx_attendance_session_checkedinat` — per-session feed for the
+  WebSocket live view
+* `idx_audit_action_created` — `/admin/audit?action=...` filter
+* `idx_device_linkedat` — system overview "active devices in the
+  last hour" predicate
+
+The migration is idempotent (`CREATE INDEX IF NOT EXISTS`) so
+re-running `bash deploy/migrate.sh` is safe at any time.
+
+### 257. Redact DATABASE_URL on startup
+
+Mitigated. The password component of the conninfo is masked with
+`***` before printing. The pm2 startup log used to be the easiest
+place to lift the database password; now it shows only
+`postgresql://rofi:***@localhost:5432/eventplatform`.
+
+### 258, 259. Security headers
+
+Mitigated. Every response now includes:
+
+* `Strict-Transport-Security: max-age=31536000; includeSubDomains`
+  — pins HTTPS for the rofidoesthings.site domain across all
+  subdomains for a year.
+* `Permissions-Policy: geolocation=(), microphone=(),
+  camera=(self)` — denies geolocation/mic, allows camera only on
+  same-origin (the PWA needs it for QR scanning).
+
+The existing `X-Content-Type-Options`, `X-Frame-Options`, and
+`Referrer-Policy` headers are preserved.
+
+## Tracked / Documented
+
+* **251** Participant.team nullable — relaxing on the database
+  side is risky; bulk-import flows depend on the current
+  permissive constraint. The C handler validates non-empty
+  before insert, and the API contract guarantees a string.
+* **252** Attendance.device_id FK — historical rows from before
+  the device table existed prevent us from adding the FK
+  retroactively without data cleanup.
+* **253** RevokedToken collision — 64-bit hex prefix gives
+  ≈10¹⁹ slots; collision space is fine until we exceed
+  ~4×10⁹ concurrent revoked tokens.
+* **255, 260** Tooling polish.
+
+## Verification Matrix (Round 8)
+
+| Capability                              | Test                                                |
+| --------------------------------------- | --------------------------------------------------- |
+| Migration 006 idempotent                | `bash deploy/migrate.sh` twice → second run reports skipped |
+| HSTS header present                     | `curl -sI /health \| grep -i strict-transport`     |
+| Permissions-Policy                      | `curl -sI /health \| grep -i permissions-policy`   |
+| DATABASE_URL redacted                   | restart the binary, scan log for `:***@` not the actual password |
+| Recent-checkins query plan              | `EXPLAIN SELECT * FROM "Attendance" ORDER BY "checkedInAt" DESC LIMIT 50` → Index Scan |
