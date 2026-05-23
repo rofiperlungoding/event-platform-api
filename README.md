@@ -7,7 +7,7 @@ co-hosted on one Android tablet. Designed and verified to absorb a
 
 | Property                | Value                                       |
 | ----------------------- | ------------------------------------------- |
-| Version                 | 0.7.1-c                                     |
+| Version                 | 0.7.2-c                                     |
 | Reference host          | Galaxy Tab A8, Unisoc T618, 3 GB RAM        |
 | Runtime                 | Termux (no container, no proot)             |
 | Concurrency model       | Pre-fork worker pool, 8 workers             |

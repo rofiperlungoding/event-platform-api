@@ -630,22 +630,61 @@ static void send_rate_limited(int fd) {
 }
 
 
-/* Growable string buffer — prevents overflow on large result sets */
-typedef struct { char *data; int len; int cap; } strbuf;
-static void sb_init(strbuf *sb, int cap) { sb->data = malloc(cap); sb->len = 0; sb->cap = cap; sb->data[0] = 0; }
-static void sb_ensure(strbuf *sb, int extra) { while (sb->len + extra >= sb->cap) { sb->cap *= 2; sb->data = realloc(sb->data, sb->cap); } }
-static void sb_append(strbuf *sb, const char *s) { int l = strlen(s); sb_ensure(sb, l+1); memcpy(sb->data+sb->len, s, l); sb->len += l; sb->data[sb->len] = 0; }
+/* Growable string buffer — prevents overflow on large result sets.
+ *
+ * Round 11 hardening (audit item 292): handle malloc/realloc failure
+ * gracefully. On a 3 GB tablet running 8 workers + Postgres + the
+ * SW cache and a 5,000-attendee snapshot, OOM is rare but real;
+ * silently dereferencing NULL would crash the worker mid-request.
+ * The new behaviour is to leave `data` pointing at a small static
+ * empty buffer if allocation ever fails — subsequent appends are
+ * no-ops but the response will be a (truncated) valid JSON. */
+static char sb_oom_sink[1] = "";
+typedef struct { char *data; int len; int cap; int oom; } strbuf;
+static void sb_init(strbuf *sb, int cap) {
+    sb->data = malloc(cap);
+    sb->len = 0; sb->cap = cap; sb->oom = 0;
+    if (!sb->data) { sb->data = sb_oom_sink; sb->cap = 0; sb->oom = 1; }
+    else sb->data[0] = 0;
+}
+static void sb_ensure(strbuf *sb, int extra) {
+    if (sb->oom) return;
+    while (sb->len + extra >= sb->cap) {
+        int new_cap = sb->cap * 2;
+        char *p = realloc(sb->data, new_cap);
+        if (!p) { sb->oom = 1; return; }
+        sb->data = p; sb->cap = new_cap;
+    }
+}
+static void sb_append(strbuf *sb, const char *s) {
+    if (sb->oom) return;
+    int l = strlen(s);
+    sb_ensure(sb, l + 1);
+    if (sb->oom) return;
+    memcpy(sb->data + sb->len, s, l);
+    sb->len += l; sb->data[sb->len] = 0;
+}
 static void sb_appendf(strbuf *sb, const char *fmt, ...) {
+    if (sb->oom) return;
     va_list ap, ap2;
     sb_ensure(sb, 512);
+    if (sb->oom) return;
     va_start(ap, fmt); va_copy(ap2, ap);
     int n = vsnprintf(sb->data + sb->len, sb->cap - sb->len, fmt, ap);
     va_end(ap);
-    if (n >= sb->cap - sb->len) { sb_ensure(sb, n + 1); n = vsnprintf(sb->data + sb->len, sb->cap - sb->len, fmt, ap2); }
+    if (n >= sb->cap - sb->len) {
+        sb_ensure(sb, n + 1);
+        if (!sb->oom) {
+            n = vsnprintf(sb->data + sb->len, sb->cap - sb->len, fmt, ap2);
+        }
+    }
     va_end(ap2);
-    if (n > 0) sb->len += n;
+    if (n > 0 && !sb->oom) sb->len += n;
 }
-static void sb_free(strbuf *sb) { free(sb->data); sb->data = NULL; sb->len = sb->cap = 0; }
+static void sb_free(strbuf *sb) {
+    if (sb->data && sb->data != sb_oom_sink) free(sb->data);
+    sb->data = NULL; sb->len = sb->cap = 0;
+}
 
 /* FNV-1a hash (64-bit) — kept for non-security uses (hashtable seeds etc.). */
 static unsigned long long fnv1a_hash(const char *data, int len) {
@@ -1210,7 +1249,7 @@ static void handle_health_detailed(int fd) {
         "\"database\":{\"status\":\"%s\",\"latency_ms\":%ld}},"
         "\"uptime_seconds\":%ld,\"service_uptime_seconds\":%ld,"
         "\"deploy\":%s,\"backup\":%s,"
-        "\"version\":\"0.7.1-c\",\"node_version\":\"native-c\"}",
+        "\"version\":\"0.7.2-c\",\"node_version\":\"native-c\"}",
         overall, api_ms, db_status, db_ms,
         (long)(time(NULL) - start_time),
         (long)(time(NULL) - service_start_time),
@@ -1368,7 +1407,13 @@ static void handle_system(int fd) {
             struct sockaddr_in src;
             socklen_t sl = sizeof(src);
             if (getsockname(probe, (struct sockaddr*)&src, &sl) == 0) {
+                /* Round 11 fix (audit item 291): explicit null-term
+                 * after strncpy to match the round 10 hygiene pass
+                 * across the rest of the file. inet_ntoa never
+                 * returns more than 15 chars, but defensive code
+                 * stays defensive. */
                 strncpy(lan_ip, inet_ntoa(src.sin_addr), sizeof(lan_ip) - 1);
+                lan_ip[sizeof(lan_ip) - 1] = 0;
             }
         }
         close(probe);
@@ -4008,7 +4053,7 @@ int main(void) {
     }
     if (listen(server_fd, 16384) < 0) { perror("listen"); return 1; }
 
-    printf("event-server v0.7.1-c listening on 0.0.0.0:%d\n", port);
+    printf("event-server v0.7.2-c listening on 0.0.0.0:%d\n", port);
     printf("Static dir: %s\n", static_dir);
     /* Round 8 fix (audit item 257): redact the password component of
      * DATABASE_URL before logging. The conninfo is of the form

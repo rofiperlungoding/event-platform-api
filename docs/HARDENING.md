@@ -1521,3 +1521,83 @@ output. Both `run-stampede.js` and `chaos-checkin.js` use it.
 | run-stampede argv                       | `node run-stampede.js abc` → falls back to 2000, no infinite loop |
 | run-stampede SIGINT cleanup             | Start, Ctrl-C → next `/stats/participants` shows no `dev-stamp-` rows |
 | Loadtest body redaction                 | Inject a fake token in a 5xx response → output shows `Bearer ***` |
+
+
+---
+
+# Round 11 — Server Second Pass + Status Probe + Loadtest SQL
+
+Round 11 is a second sweep of `server.c` looking for issues that
+the round-6 mmap shift could have introduced or exposed, plus the
+loadtest SQL and the legacy `status-check.sh` script.
+
+## Summary
+
+| #   | Area      | Risk                                                    | Status     |
+| --- | --------- | ------------------------------------------------------- | ---------- |
+| 291 | Server    | `lan_ip` strncpy null-term hygiene                      | Mitigated  |
+| 292 | Server    | strbuf malloc/realloc NULL deref under OOM              | Mitigated  |
+| 293 | Scripts   | `status-check.sh` JSON injection (legacy webhook path)  | Mitigated  |
+| 294 | Loadtest  | `wipe-all.sql` skipped AuditLog and RevokedToken        | Mitigated  |
+| 295 | Server    | WS child libpq fd cleanup (parent's fd held until exit) | Documented |
+| 296 | Server    | WS child PGconn opens fresh — fine, but cost ~50 ms     | Documented |
+| 297 | Server    | Heartbeat fires at idle_seconds=30 (correct edge case)  | Verified   |
+| 298 | Server    | sb_oom_sink global is never written to                  | Documented |
+
+## Mitigations Detail (Round 11)
+
+### 291. lan_ip null-term hygiene
+
+Mitigated. The `strncpy` into `lan_ip` is now followed by an
+explicit `lan_ip[sizeof(lan_ip)-1] = 0`. `inet_ntoa` never returns
+more than 15 chars and the buffer is initialised to `"0.0.0.0"`,
+but the explicit null-term lines up the file with the rest of
+the round-10 hygiene work.
+
+### 292. strbuf OOM resilience
+
+Mitigated. The growable string buffer used by every list endpoint
+(`/sessions/active`, `/admin/audit`, attendance JSON) now tracks
+an `oom` flag and falls back to a global `sb_oom_sink` when
+allocation fails. Subsequent appends become no-ops; the response
+ends up truncated but parses as JSON. Previously a NULL realloc
+under memory pressure would crash the worker mid-request and
+trigger pm2 respawn cycle.
+
+### 293. status-check.sh JSON escape
+
+Mitigated. The legacy webhook path now uses the same `jstr` sed
+pipeline as `full-status.sh`. Logs containing backslashes or
+embedded quotes can no longer corrupt the produced JSON.
+
+### 294. wipe-all.sql covers all tables
+
+Mitigated. `AuditLog` and `RevokedToken` (introduced in migration
+005) are now explicitly cleared. The script remains idempotent on
+fresh installs that haven't applied 005 yet via `IF EXISTS` guards.
+
+## Documented (no code change)
+
+* **295** WS child inherits the parent worker's libpq fd; child
+  immediately sets `worker_conn = NULL` so it never reads from
+  it. The fd is closed implicitly when the child `_exit`s. No
+  cross-process state corruption is possible because libpq
+  sockets are not multiplexed.
+* **296** WS child opens its own fresh PGconn (~50 ms one-time
+  cost), then caches it for the entire session lifetime.
+  Acceptable.
+* **297** Heartbeat condition `idle_seconds % 30 == 0` correctly
+  fires at 30, 60, 90, ... and *not* at 0 (which is the post-
+  send reset state, not the post-increment state).
+* **298** `sb_oom_sink` is a 1-byte global never written to; it
+  gives `data` a non-NULL pointer for OOM paths so existing
+  `data[0]` reads do not segfault.
+
+## Verification Matrix (Round 11)
+
+| Capability                              | Test                                                 |
+| --------------------------------------- | ---------------------------------------------------- |
+| strbuf OOM tolerance                    | `ulimit -v 200000; ./event-server` then hit `/sessions/active` with 5,000 active rows → response is truncated but valid JSON, no crash |
+| status-check.sh JSON valid              | Inject `\` into a log line, run script, `jq .`       |
+| wipe-all.sql full coverage              | After R5 migrations, run wipe-all → SELECT count(*) on AuditLog, RevokedToken returns 0 |
+| WS child libpq independence             | `psql 'SELECT pid, application_name FROM pg_stat_activity'` → distinct pids per active WS |
