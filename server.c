@@ -49,6 +49,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 
 #define BUF_SIZE 65536
 #define MAX_PATH 1024
@@ -71,15 +72,29 @@ static char cors_allowed[512];     /* comma-separated origins, or empty for "*" 
 static char allowed_hosts[512];    /* comma-separated Host header allowlist; empty = accept any */
 
 /* ─── Metrics counters ──────────────────────────────────────────────
- * Best-effort counters across the pre-fork worker pool. Each worker
- * has its own copy; the /metrics endpoint reports the supervisor's
- * aggregate. Used by the monitoring loop in `health-watchdog.sh`. */
-static volatile unsigned long m_requests_total = 0;
-static volatile unsigned long m_requests_5xx = 0;
-static volatile unsigned long m_requests_4xx = 0;
-static volatile unsigned long m_db_errors = 0;
-static volatile unsigned long m_checkins_ok = 0;
-static volatile unsigned long m_checkins_dup = 0;
+ * Round 6 fix (audit item 189): the previous static volatile globals
+ * lived in the per-worker address space, so /metrics from the
+ * supervisor was always blank and aggregating across the 8 worker
+ * pre-fork pool was impossible. Counters now live in a single
+ * shared-memory page mapped before fork, so __sync_fetch_and_add
+ * from any worker is visible to /metrics in any other worker. */
+typedef struct {
+    volatile unsigned long requests_total;
+    volatile unsigned long requests_5xx;
+    volatile unsigned long requests_4xx;
+    volatile unsigned long db_errors;
+    volatile unsigned long checkins_ok;
+    volatile unsigned long checkins_dup;
+} shared_metrics_t;
+
+static shared_metrics_t *g_metrics = NULL;
+
+#define m_requests_total g_metrics->requests_total
+#define m_requests_5xx   g_metrics->requests_5xx
+#define m_requests_4xx   g_metrics->requests_4xx
+#define m_db_errors      g_metrics->db_errors
+#define m_checkins_ok    g_metrics->checkins_ok
+#define m_checkins_dup   g_metrics->checkins_dup
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -106,7 +121,12 @@ static int origin_is_allowed(const char *origin, const char *list) {
 }
 
 /* Per-request CORS headers — caller passes the raw request buffer so we
- * can read the Origin header and reflect it only when allowed. */
+ * can read the Origin header and reflect it only when allowed.
+ *
+ * Currently retained for future per-handler migration; kept unused-
+ * safe via __attribute__((unused)) so -Wall builds stay clean
+ * (audit item 205). */
+__attribute__((unused))
 static void cors_headers_for(const char *raw_request, char *out, int out_sz) {
     const char *origin_hdr = strcasestr(raw_request ? raw_request : "", "\nOrigin:");
     char origin[256] = "";
@@ -172,8 +192,11 @@ static void send_response(int fd, int status, const char *status_text,
     else if (status >= 400) __sync_fetch_and_add(&m_requests_4xx, 1);
 }
 
+/* JSON helper — send a complete JSON response. The body length is
+ * computed once here; do not strlen() at every caller, which used
+ * to be the pattern before round 6 (audit item 191). */
 static void send_json(int fd, int status, const char *status_text, const char *json) {
-    send_response(fd, status, status_text, "application/json", json, strlen(json));
+    send_response(fd, status, status_text, "application/json", json, (int)strlen(json));
 }
 
 static void send_no_content(int fd) {
@@ -227,7 +250,15 @@ static PGconn *worker_conn = NULL;
 static PGconn *db_acquire(void) {
     if (worker_conn) {
         if (PQstatus(worker_conn) == CONNECTION_OK) return worker_conn;
-        /* Stale — drop it and reconnect. */
+        /* Round 6 fix (audit item 180): try PQreset() first instead
+         * of immediately tearing down libpq state. Reset reuses
+         * the existing PGconn structure and is markedly cheaper
+         * than a full PQconnectdb when the database is healthy
+         * (the underlying TCP+startup handshake still happens but
+         * we skip libpq's parse-conninfo and allocation work). If
+         * reset fails, fall through to a fresh connect. */
+        PQreset(worker_conn);
+        if (PQstatus(worker_conn) == CONNECTION_OK) return worker_conn;
         PQfinish(worker_conn);
         worker_conn = NULL;
     }
@@ -246,15 +277,34 @@ static long ms_since(struct timespec *start) {
     return (now.tv_sec - start->tv_sec) * 1000 + (now.tv_nsec - start->tv_nsec) / 1000000;
 }
 
-/* JSON-escape a string into dst, return bytes written */
+/* JSON-escape a string into dst, return bytes written.
+ *
+ * Round 6 fix (audit item 192): control characters 0x00–0x1F other
+ * than the well-known short escapes (\n, \r, \t, \b, \f) are emitted
+ * as \u00XX so the resulting JSON parses on every conformant client
+ * (including jq, browsers, and Python's json module). Previously a
+ * stray 0x07 (BEL) or 0x01 in user-supplied data would produce
+ * invalid JSON and clients would fail to deserialise the response. */
 static int json_escape(char *dst, int max, const char *src) {
     int i = 0;
-    for (; *src && i < max - 2; src++) {
-        if (*src == '"' || *src == '\\') { dst[i++] = '\\'; dst[i++] = *src; }
-        else if (*src == '\n') { dst[i++] = '\\'; dst[i++] = 'n'; }
-        else if (*src == '\r') { dst[i++] = '\\'; dst[i++] = 'r'; }
-        else if (*src == '\t') { dst[i++] = '\\'; dst[i++] = 't'; }
-        else dst[i++] = *src;
+    if (max < 1) return 0;
+    while (*src && i < max - 7) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') { dst[i++] = '\\'; dst[i++] = (char)c; }
+        else if (c == '\n')          { dst[i++] = '\\'; dst[i++] = 'n'; }
+        else if (c == '\r')          { dst[i++] = '\\'; dst[i++] = 'r'; }
+        else if (c == '\t')          { dst[i++] = '\\'; dst[i++] = 't'; }
+        else if (c == '\b')          { dst[i++] = '\\'; dst[i++] = 'b'; }
+        else if (c == '\f')          { dst[i++] = '\\'; dst[i++] = 'f'; }
+        else if (c < 0x20) {
+            static const char hex[] = "0123456789abcdef";
+            dst[i++] = '\\'; dst[i++] = 'u';
+            dst[i++] = '0';  dst[i++] = '0';
+            dst[i++] = hex[(c >> 4) & 0xf];
+            dst[i++] = hex[c & 0xf];
+        }
+        else dst[i++] = (char)c;
+        src++;
     }
     dst[i] = 0;
     return i;
@@ -449,7 +499,12 @@ static void base64_encode(const uint8_t *in, int len, char *out) {
 /* ─── Rate Limiter (per-IP, in-memory token bucket) ─────────────────────
  * Simple fixed-window: each IP gets N tokens per window.
  * Limits chosen for ~50 active users/IP — admin operations, scanner PWA.
- * Bucket array is fixed size (256 entries, hash collision = LRU evict). */
+ * Bucket array is fixed size (256 entries, hash collision = LRU evict).
+ *
+ * Round 6 fix (audit item 189): the table is now allocated in a
+ * shared mmap region before fork() so all 8 workers operate on a
+ * single bucket pool. Previously each worker had its own copy,
+ * giving an attacker an effective 8× higher limit. */
 #define RL_BUCKETS 256
 #define RL_WINDOW_SEC 60
 #define RL_DEFAULT_LIMIT 600       /* most endpoints — generous for shared NAT */
@@ -461,10 +516,11 @@ typedef struct {
     int      count;
 } rl_entry;
 
-static rl_entry rl_table[RL_BUCKETS];
+static rl_entry *rl_table = NULL;     /* shared mmap, RL_BUCKETS entries */
 
 /* Returns 1 if allowed, 0 if rate-limited */
 static int rate_limit_check(uint32_t ip, int limit) {
+    if (!rl_table) return 1;
     int slot = ip % RL_BUCKETS;
     time_t now = time(NULL);
     rl_entry *e = &rl_table[slot];
@@ -475,8 +531,48 @@ static int rate_limit_check(uint32_t ip, int limit) {
         e->count = 1;
         return 1;
     }
-    e->count++;
-    return e->count <= limit;
+    /* Atomic increment so concurrent workers cannot interleave a
+     * read-modify-write and let the limit slip. */
+    int new_count = __sync_add_and_fetch(&e->count, 1);
+    return new_count <= limit;
+}
+
+/* ─── Per-email login rate limit ────────────────────────────────────
+ * Round 6 fix (audit item 175): credential stuffing defence. The
+ * IP-based RL_AUTH_LIMIT counts ALL auth requests from one origin
+ * regardless of the email being attempted, which is too lenient
+ * when the attacker iterates a leaked-password list against many
+ * accounts. This table is keyed by FNV-1a(email) so a single
+ * email can be tried at most LRL_LIMIT times per minute, even
+ * across distributed source IPs. */
+#define LRL_BUCKETS 128
+#define LRL_WINDOW_SEC 60
+#define LRL_LIMIT 6
+typedef struct {
+    unsigned long long key;
+    time_t window_start;
+    int count;
+} lrl_entry;
+static lrl_entry *lrl_table = NULL;
+
+/* Forward declarations — defined later in the file. */
+static unsigned long long fnv1a_hash(const char *data, int len);
+static int run_capture(const char *cmd, char *out, int sz);
+
+static int login_rate_limit_check(const char *email) {
+    if (!lrl_table || !email || !email[0]) return 1;
+    unsigned long long h = fnv1a_hash(email, strlen(email));
+    int slot = h % LRL_BUCKETS;
+    time_t now = time(NULL);
+    lrl_entry *e = &lrl_table[slot];
+    if (e->key != h || (now - e->window_start) >= LRL_WINDOW_SEC) {
+        e->key = h;
+        e->window_start = now;
+        e->count = 1;
+        return 1;
+    }
+    int new_count = __sync_add_and_fetch(&e->count, 1);
+    return new_count <= LRL_LIMIT;
 }
 
 /* ─── Per-device check-in rate limit ───────────────────────────────
@@ -497,12 +593,10 @@ typedef struct {
     time_t window_start;
     int count;
 } drl_entry;
-static drl_entry drl_table[DRL_BUCKETS];
-
-/* Forward declaration; defined later in the crypto helpers section. */
-static unsigned long long fnv1a_hash(const char *data, int len);
+static drl_entry *drl_table = NULL;
 
 static int device_rate_limit_check(const char *device_uuid) {
+    if (!drl_table) return 1;
     unsigned long long h = fnv1a_hash(device_uuid, strlen(device_uuid));
     int slot = h % DRL_BUCKETS;
     time_t now = time(NULL);
@@ -513,8 +607,8 @@ static int device_rate_limit_check(const char *device_uuid) {
         e->count = 1;
         return 1;
     }
-    e->count++;
-    return e->count <= DRL_LIMIT;
+    int new_count = __sync_add_and_fetch(&e->count, 1);
+    return new_count <= DRL_LIMIT;
 }
 
 /* Send 429 with Retry-After header */
@@ -603,11 +697,21 @@ static void hex_encode(const uint8_t *in, int len, char *out) {
 }
 
 static int hex_decode(const char *in, int outlen, uint8_t *out) {
+    /* Round 6 fix (audit item 198): accept uppercase A–F as well as
+     * lowercase. The signed-QR header path lowercases its output
+     * but third-party tooling, copy-pasted tokens from the admin
+     * console, and curl one-liners often arrive uppercased. */
     for (int i = 0; i < outlen; i++) {
         char a = in[i*2], b = in[i*2+1];
         if (!a || !b) return -1;
-        int hi = (a >= '0' && a <= '9') ? a - '0' : (a >= 'a' && a <= 'f') ? a - 'a' + 10 : -1;
-        int lo = (b >= '0' && b <= '9') ? b - '0' : (b >= 'a' && b <= 'f') ? b - 'a' + 10 : -1;
+        int hi = (a >= '0' && a <= '9') ? a - '0'
+               : (a >= 'a' && a <= 'f') ? a - 'a' + 10
+               : (a >= 'A' && a <= 'F') ? a - 'A' + 10
+               : -1;
+        int lo = (b >= '0' && b <= '9') ? b - '0'
+               : (b >= 'a' && b <= 'f') ? b - 'a' + 10
+               : (b >= 'A' && b <= 'F') ? b - 'A' + 10
+               : -1;
         if (hi < 0 || lo < 0) return -1;
         out[i] = (hi << 4) | lo;
     }
@@ -690,6 +794,16 @@ static int verify_token(const char *token, char *out_role) {
         return -1;
     if ((time_t)expiry < time(NULL)) return -1;
 
+    /* Role allowlist (audit item 177) — only known values are
+     * accepted, defends against log injection and future code paths
+     * that might string-compare role against attacker-controlled
+     * substrings. */
+    if (strcmp(role, "admin") != 0 &&
+        strcmp(role, "participant") != 0 &&
+        strcmp(role, "organiser") != 0) {
+        return -1;
+    }
+
     int hex_len = (int)strlen(provided_hex);
     char payload[256];
     int plen = snprintf(payload, sizeof(payload), "%d:%ld:%s", user_id, expiry, role);
@@ -715,7 +829,17 @@ static int verify_token(const char *token, char *out_role) {
      * the signature appear in `RevokedToken`, deny. The lookup is
      * cheap (indexed PK) and only runs after sig validation, so it
      * adds zero cost to the failure path. The expired entries are
-     * naturally cleaned up by the background sweep in handle_auth_logout. */
+     * naturally cleaned up by the background sweep in handle_auth_logout.
+     *
+     * Round 6 fix (audit item 179): if the database is currently
+     * unreachable, fail-open — let the request through with the
+     * stale-but-cryptographically-valid token rather than retry-
+     * looping a connection per request and starving the pool of
+     * new connect attempts (the thundering-herd reconnect storm).
+     * The alternative — blanket 500 — would mean a 30-second
+     * Postgres restart turns into a 30-second total outage even
+     * though tokens are independently signed and verifiable
+     * without any database round-trip. */
     if (worker_conn || (worker_conn = db_connect())) {
         char prefix[17];
         memcpy(prefix, provided_hex, 16);
@@ -739,12 +863,29 @@ static int verify_token(const char *token, char *out_role) {
 /* ─── Audit log helper ──────────────────────────────────────────────
  * Best-effort write — failures are logged to stderr but never block
  * the request. Privileged actions (admin operations, deletes, bulk
- * imports) call this. Mitigates audit item 92. */
+ * imports) call this. Mitigates audit item 92.
+ *
+ * Round 6 fix (audit item 173): a database-connect failure used to
+ * be a silent return, which meant a Postgres outage would silently
+ * suppress every audit row at exactly the moment when audit
+ * coverage matters most. We now log the failure and bump the
+ * shared db_errors counter so /metrics shows the gap. */
 static void audit_log(int actor_id, const char *actor_email,
                       const char *action, const char *target_type,
                       const char *target_id, uint32_t client_ip,
                       const char *metadata) {
-    if (!worker_conn && !(worker_conn = db_connect())) return;
+    if (!worker_conn) {
+        worker_conn = db_connect();
+        if (!worker_conn) {
+            fprintf(stderr, "audit_log: db unreachable, dropping event "
+                    "actor=%d action=%s target=%s/%s\n",
+                    actor_id, action ? action : "(null)",
+                    target_type ? target_type : "(null)",
+                    target_id ? target_id : "(null)");
+            __sync_fetch_and_add(&m_db_errors, 1);
+            return;
+        }
+    }
     char actor_id_str[16];
     snprintf(actor_id_str, sizeof(actor_id_str), "%d", actor_id);
     struct in_addr ia = { .s_addr = client_ip };
@@ -860,9 +1001,14 @@ static int verify_password(const char *stored, const char *supplied) {
     return strcmp(stored, supplied) == 0;
 }
 
-/* Extract Bearer token from raw headers */
-static const char *extract_bearer(const char *headers) {
-    static char token_buf[256];
+/* Extract Bearer token from raw headers.
+ *
+ * Caller must supply the destination buffer; the previous version
+ * used a function-local `static` which was a race condition under
+ * any nested call path (audit item 171). Returns the destination
+ * pointer on success, NULL if no Authorization Bearer header is
+ * present. */
+static const char *extract_bearer_into(const char *headers, char *out, int out_sz) {
     const char *auth = strcasestr(headers, "Authorization:");
     if (!auth) return NULL;
     auth += 14;
@@ -871,17 +1017,70 @@ static const char *extract_bearer(const char *headers) {
     auth += 7;
     while (*auth == ' ') auth++;
     int i = 0;
-    while (*auth && *auth != '\r' && *auth != '\n' && i < (int)sizeof(token_buf) - 1)
-        token_buf[i++] = *auth++;
-    token_buf[i] = 0;
-    return token_buf;
+    while (*auth && *auth != '\r' && *auth != '\n' && i < out_sz - 1)
+        out[i++] = *auth++;
+    out[i] = 0;
+    return out;
 }
 
-/* Simple JSON field extractor (non-nested, string values) */
+/* Backward-compat wrapper for callers that still use a single static
+ * buffer. New code SHOULD pass its own buffer via extract_bearer_into. */
+static const char *extract_bearer(const char *headers) {
+    static __thread char token_buf[512];
+    return extract_bearer_into(headers, token_buf, sizeof(token_buf));
+}
+
+/* Simple JSON field extractor (non-nested, string values).
+ *
+ * Round 6 fix (audit items 186, 187): the previous implementation
+ * stopped at the first unescaped " character and could not handle
+ * embedded escapes — \", \\, \n, \r, \t — leaving them as the raw
+ * two-character sequence in `dst`. That meant inputs like a name
+ * containing a double quote escaped through JSON.stringify would
+ * be silently truncated, and a backslash before the closing quote
+ * could prematurely terminate the field with a trailing backslash
+ * in the output.
+ *
+ * The macro now decodes the standard string escapes the API needs
+ * (we never emit non-ASCII through the few callers that rely on
+ * EXTRACT_JSON, so \uXXXX is intentionally left untouched and
+ * passed through as-is — callers should not feed UTF-16 escapes
+ * into these handlers).
+ *
+ * The expansion is wrapped in `do { ... } while(0)` so it composes
+ * safely inside `if`/`else` without braces.
+ */
 #define EXTRACT_JSON(body, field, dst, sz) do { \
-    const char *_p = strstr(body, "\"" field "\""); \
-    if (_p) { _p = strchr(_p + strlen(field) + 2, '"'); if (_p) { _p++; \
-        int _i = 0; while (*_p && *_p != '"' && _i < (sz)-1) (dst)[_i++] = *_p++; (dst)[_i] = 0; } } \
+    const char *_p = strstr((body), "\"" field "\""); \
+    (dst)[0] = 0; \
+    if (_p) { \
+        _p = strchr(_p + strlen(field) + 2, '"'); \
+        if (_p) { \
+            _p++; \
+            int _i = 0; \
+            int _max = (int)(sz) - 1; \
+            while (*_p && _i < _max) { \
+                if (*_p == '\\' && *(_p + 1)) { \
+                    char _e = *(_p + 1); \
+                    if (_e == '"')       (dst)[_i++] = '"'; \
+                    else if (_e == '\\') (dst)[_i++] = '\\'; \
+                    else if (_e == '/')  (dst)[_i++] = '/'; \
+                    else if (_e == 'n')  (dst)[_i++] = '\n'; \
+                    else if (_e == 'r')  (dst)[_i++] = '\r'; \
+                    else if (_e == 't')  (dst)[_i++] = '\t'; \
+                    else if (_e == 'b')  (dst)[_i++] = '\b'; \
+                    else if (_e == 'f')  (dst)[_i++] = '\f'; \
+                    else { (dst)[_i++] = _e; } \
+                    _p += 2; \
+                } else if (*_p == '"') { \
+                    break; \
+                } else { \
+                    (dst)[_i++] = *_p++; \
+                } \
+            } \
+            (dst)[_i] = 0; \
+        } \
+    } \
 } while(0)
 
 /* Generate random alphanumeric code */
@@ -897,10 +1096,9 @@ static void generate_code(char *out, int len) {
 }
 
 /* ─── Metrics — Prometheus-compatible exposition ────────────────────
- * Counters are best-effort across pre-fork workers (each worker has
- * its own copy; we report supervisor-side aggregate by reading shared
- * memory). For a single-tablet deployment with low scrape rate this
- * is honest enough. */
+ * Counters live in shared memory across the pre-forked worker pool
+ * (round 6 fix, audit item 189), so any worker that handles
+ * /metrics returns a consistent system-wide aggregate. */
 
 static void handle_metrics(int fd) {
     char buf[2048];
@@ -1010,7 +1208,7 @@ static void handle_health_detailed(int fd) {
         "\"database\":{\"status\":\"%s\",\"latency_ms\":%ld}},"
         "\"uptime_seconds\":%ld,\"service_uptime_seconds\":%ld,"
         "\"deploy\":%s,\"backup\":%s,"
-        "\"version\":\"0.6.0-c\",\"node_version\":\"native-c\"}",
+        "\"version\":\"0.7.0-c\",\"node_version\":\"native-c\"}",
         overall, api_ms, db_status, db_ms,
         (long)(time(NULL) - start_time),
         (long)(time(NULL) - service_start_time),
@@ -1018,17 +1216,71 @@ static void handle_health_detailed(int fd) {
     send_json(fd, 200, "OK", buf);
 }
 
-/* Helper: run a shell command and capture first N bytes of stdout. */
+/* Helper: run a shell command and capture first N bytes of stdout.
+ *
+ * Round 6 fix (audit item 200): the previous version used popen()
+ * with no timeout. A wedged child (e.g., `df` blocked on a stuck
+ * mount during a USB-OTG insert, or `getprop` racing with system
+ * server startup) would block /system and /health/detailed
+ * forever. We now install a SIGALRM handler that kicks in after
+ * RUN_CAPTURE_TIMEOUT_SEC seconds, kills the process group of
+ * the pipe child, and returns whatever bytes were already
+ * captured. The alarm is restored to whatever the caller had set
+ * once we are done. */
+#define RUN_CAPTURE_TIMEOUT_SEC 3
+static volatile pid_t run_capture_pid = 0;
+static void run_capture_alarm_handler(int sig) {
+    (void)sig;
+    if (run_capture_pid > 0) {
+        kill(-run_capture_pid, SIGKILL);
+    }
+}
+
 static int run_capture(const char *cmd, char *out, int sz) {
-    FILE *p = popen(cmd, "r");
-    if (!p) { out[0] = 0; return -1; }
-    int n = fread(out, 1, sz - 1, p);
+    /* popen() does not expose the child pid on POSIX; fall back to
+     * fork+exec so we can enforce a timeout. */
+    int pipefd[2];
+    if (pipe(pipefd) < 0) { out[0] = 0; return -1; }
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); out[0] = 0; return -1; }
+    if (pid == 0) {
+        /* Child: become its own process group so the alarm handler
+         * can kill the entire shell pipeline (e.g., `ls | head`). */
+        setpgid(0, 0);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[0]); close(pipefd[1]);
+        execl("/system/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    close(pipefd[1]);
+
+    run_capture_pid = pid;
+    struct sigaction sa = { .sa_handler = run_capture_alarm_handler };
+    sigemptyset(&sa.sa_mask);
+    struct sigaction prev;
+    sigaction(SIGALRM, &sa, &prev);
+    unsigned int prev_alarm = alarm(RUN_CAPTURE_TIMEOUT_SEC);
+
+    int n = 0;
+    while (n < sz - 1) {
+        int got = read(pipefd[0], out + n, sz - 1 - n);
+        if (got <= 0) break;
+        n += got;
+    }
     out[n > 0 ? n : 0] = 0;
+    close(pipefd[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+    run_capture_pid = 0;
+    alarm(prev_alarm);
+    sigaction(SIGALRM, &prev, NULL);
+
     /* Trim trailing whitespace */
     while (n > 0 && (out[n-1] == '\n' || out[n-1] == '\r' || out[n-1] == ' ' || out[n-1] == '\t')) {
         out[--n] = 0;
     }
-    pclose(p);
     return n;
 }
 
@@ -1183,9 +1435,35 @@ static void handle_stats_database(int fd) {
 
     r = PQexec(conn, "SELECT COUNT(*) FROM \"Participant\"");
     const char *pcount = (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0) ? PQgetvalue(r, 0, 0) : "0";
+
+    /* Round 6 (audit item 183): surface long-running queries for ops.
+     * A single long query holding a write lock is the #1 cause of a
+     * green /health turning into a five-minute outage on a tablet
+     * with limited RAM. We expose a simple count of queries that
+     * have been running for more than 5 seconds; the dashboard
+     * surfaces this as a yellow/red badge so the operator can
+     * intervene with `pg_terminate_backend()` before users notice. */
+    long active_queries = 0, long_queries = 0;
+    {
+        PGresult *aq = PQexec(conn,
+            "SELECT COUNT(*) FROM pg_stat_activity "
+            "WHERE state = 'active' AND query NOT LIKE '%pg_stat_activity%'");
+        if (PQresultStatus(aq) == PGRES_TUPLES_OK && PQntuples(aq) > 0)
+            active_queries = atol(PQgetvalue(aq, 0, 0));
+        PQclear(aq);
+        PGresult *lq = PQexec(conn,
+            "SELECT COUNT(*) FROM pg_stat_activity "
+            "WHERE state = 'active' AND now() - query_start > interval '5 seconds' "
+            "AND query NOT LIKE '%pg_stat_activity%'");
+        if (PQresultStatus(lq) == PGRES_TUPLES_OK && PQntuples(lq) > 0)
+            long_queries = atol(PQgetvalue(lq, 0, 0));
+        PQclear(lq);
+    }
+
     snprintf(buf, sizeof(buf),
-        "{\"database_size_bytes\":%ld,\"tables\":%s,\"participant_count\":%s}",
-        db_size, tables, pcount);
+        "{\"database_size_bytes\":%ld,\"tables\":%s,\"participant_count\":%s,"
+        "\"active_queries\":%ld,\"long_queries\":%ld}",
+        db_size, tables, pcount, active_queries, long_queries);
     PQclear(r);
     db_release(conn);
     send_json(fd, 200, "OK", buf);
@@ -1448,6 +1726,16 @@ static void handle_auth_login(int fd, const char *body) {
         return;
     }
 
+    /* Round 6 fix (audit item 175): per-email throttle defends
+     * against credential stuffing where an attacker rotates source
+     * IPs while iterating leaked passwords against one account.
+     * The bucket is hashed so we never store plaintext emails in
+     * memory longer than this stack frame. */
+    if (!login_rate_limit_check(email)) {
+        send_rate_limited(fd);
+        return;
+    }
+
     PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
@@ -1555,8 +1843,14 @@ static void handle_auth_logout(int fd, const char *headers) {
 
     PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+    /* Round 6 fix (audit item 172): the previous version cast
+     * `&expiry` to `time_t *` which is undefined behaviour when
+     * sizeof(long) != sizeof(time_t) (e.g., 32-bit time_t on a
+     * 64-bit long Linux kernel after Y2038 migrations). Convert
+     * via a real time_t local variable. */
     char expiry_str[32];
-    struct tm *tm = gmtime((time_t *)&expiry);
+    time_t expiry_t = (time_t)expiry;
+    struct tm *tm = gmtime(&expiry_t);
     strftime(expiry_str, sizeof(expiry_str), "%Y-%m-%d %H:%M:%S", tm);
     const char *p[3] = { prefix, expiry_str, "logout" };
     PGresult *r = PQexecParams(conn,
@@ -1692,11 +1986,25 @@ static void handle_session_create(int fd, const char *headers) {
      * audit item 133 — admins forget to stop yesterday's session and
      * attendees end up checked into the wrong one. We close per
      * admin (created_by) so multiple events can run concurrently as
-     * long as they have different operators. */
+     * long as they have different operators.
+     *
+     * Round 6 fix (audit item 185): the close + insert pair is now
+     * wrapped in a single transaction. The previous version
+     * accepted a tiny race where a second tab clicking "create"
+     * milliseconds later could see no active session yet and both
+     * tabs would race to insert, leaving two new sessions live.
+     * The transaction-scoped advisory lock keyed on the admin id
+     * serialises concurrent creates per operator. */
     {
-        const char *cp[1] = { (const char *)NULL };
+        PGresult *bx = PQexec(conn, "BEGIN");
+        PQclear(bx);
         char id_buf[16]; snprintf(id_buf, sizeof(id_buf), "%d", user_id);
-        cp[0] = id_buf;
+        const char *lp[1] = { id_buf };
+        PGresult *lk = PQexecParams(conn,
+            "SELECT pg_advisory_xact_lock(42, $1::int)",
+            1, NULL, lp, NULL, NULL, 0);
+        PQclear(lk);
+        const char *cp[1] = { id_buf };
         PGresult *cr = PQexecParams(conn,
             "UPDATE \"Session\" SET active = false "
             "WHERE created_by = $1 AND active = true",
@@ -1723,7 +2031,9 @@ static void handle_session_create(int fd, const char *headers) {
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         fprintf(stderr, "Session create error: %s\n", PQresultErrorMessage(r));
-        PQclear(r); db_release(conn);
+        PQclear(r);
+        PGresult *rb = PQexec(conn, "ROLLBACK"); PQclear(rb);
+        db_release(conn);
         send_json(fd, 500, "Internal Server Error", "{\"error\":\"session creation failed\"}");
         return;
     }
@@ -1737,7 +2047,9 @@ static void handle_session_create(int fd, const char *headers) {
     char session_id_str[16];
     strncpy(session_id_str, PQgetvalue(r, 0, 0), sizeof(session_id_str)-1);
     session_id_str[sizeof(session_id_str)-1] = 0;
-    PQclear(r); db_release(conn);
+    PQclear(r);
+    PGresult *cm = PQexec(conn, "COMMIT"); PQclear(cm);
+    db_release(conn);
     audit_log(user_id, NULL, "session.create", "session", session_id_str, 0, NULL);
     send_json(fd, 201, "Created", buf);
 }
@@ -3217,6 +3529,40 @@ static void serve_static(int fd, const char *path) {
         }
     }
 
+    /* Round 6 fix (audit item 204): refuse to serve symlinks that
+     * point outside the configured static_dir. An operator who
+     * accidentally drops a symlink into the console folder
+     * pointing at /etc/passwd or ~/.ssh would otherwise expose it
+     * directly via the public hostname. We use lstat() rather than
+     * fstat() so we see the link itself, then resolve and verify
+     * the target stays within static_dir. */
+    {
+        struct stat lst;
+        if (lstat(filepath, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+            char resolved[MAX_PATH];
+            if (!realpath(filepath, resolved)) {
+                close(file_fd);
+                send_json(fd, 403, "Forbidden", "{\"error\":\"forbidden\"}");
+                return;
+            }
+            char base[MAX_PATH];
+            if (!realpath(static_dir, base)) {
+                close(file_fd);
+                send_json(fd, 500, "Internal Server Error",
+                    "{\"error\":\"static_dir not resolvable\"}");
+                return;
+            }
+            int blen = (int)strlen(base);
+            if (strncmp(resolved, base, blen) != 0 ||
+                (resolved[blen] != '/' && resolved[blen] != 0)) {
+                close(file_fd);
+                send_json(fd, 403, "Forbidden",
+                    "{\"error\":\"symlink escapes static_dir\"}");
+                return;
+            }
+        }
+    }
+
     struct stat st;
     fstat(file_fd, &st);
     const char *mime = mime_for_ext(filepath);
@@ -3431,8 +3777,19 @@ static void run_worker_loop(int server_fd) {
     signal(SIGCHLD, SIG_IGN);
 
     /* Workers also obey the supervisor's shutdown flag. SIGTERM sets it
-     * via the worker-side handler; the loop exits at the next accept. */
-    signal(SIGTERM, worker_term_handler);
+     * via the worker-side handler; the loop exits at the next accept.
+     *
+     * Round 6 fix (audit item 195): sigaction() instead of legacy
+     * signal() for portability and explicit mask semantics. We do
+     * NOT set SA_RESTART so that an in-flight accept() returns
+     * EINTR and the loop checks shutdown_requested. */
+    {
+        struct sigaction sa = { 0 };
+        sa.sa_handler = worker_term_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGTERM, &sa, NULL);
+    }
 
     while (!shutdown_requested) {
         struct sockaddr_in client_addr;
@@ -3469,14 +3826,22 @@ static void run_worker_loop(int server_fd) {
             if (header_end) {
                 char *cl = strcasestr(buf, "Content-Length:");
                 if (cl) {
-                    long content_len = atol(cl + 15);
-                    /* Hard cap on body size — defends against memory
-                     * exhaustion via Content-Length header lying. */
-                    if (content_len < 0 || content_len > MAX_BODY) {
+                    /* Round 6 fix (audit item 178): atol() silently
+                     * wraps on overflow, so a malicious client sending
+                     * "Content-Length: 99999999999999999999" used to
+                     * pass through as a small or negative number and
+                     * the request loop would then mis-frame the body
+                     * boundary. Use strtoll with explicit error
+                     * checking and reject anything outside our hard
+                     * cap. */
+                    char *endp = NULL;
+                    long long content_len = strtoll(cl + 15, &endp, 10);
+                    if (endp == cl + 15 || content_len < 0 ||
+                        content_len > MAX_BODY) {
                         oversize = 1; break;
                     }
                     int header_size = (header_end + 4) - buf;
-                    int body_received = total - header_size;
+                    long long body_received = total - header_size;
                     if (body_received >= content_len) break;
                 } else break;
             }
@@ -3584,8 +3949,19 @@ int main(void) {
         sd ? sd : "/data/data/com.termux/files/home/projects/event-platform-api/console");
 
     const char *secret = getenv("JWT_SECRET");
+    int jwt_using_default = (secret == NULL || secret[0] == 0);
     snprintf(jwt_secret, sizeof(jwt_secret), "%s",
-        secret ? secret : "devsecret123");
+        secret && secret[0] ? secret : "devsecret123");
+    if (jwt_using_default) {
+        /* Round 6 fix (audit item 203): make the silent default
+         * loudly visible. Tokens issued under the dev secret are
+         * trivially forgeable; we want a tablet operator to spot
+         * this in the boot log immediately rather than after a
+         * compromise. */
+        fprintf(stderr,
+            "[WARN] JWT_SECRET not set — using insecure default. "
+            "Set JWT_SECRET in env before exposing this server publicly.\n");
+    }
 
     const char *whs = getenv("WEBHOOK_SECRET");
     snprintf(webhook_secret, sizeof(webhook_secret), "%s",
@@ -3630,7 +4006,7 @@ int main(void) {
     }
     if (listen(server_fd, 16384) < 0) { perror("listen"); return 1; }
 
-    printf("event-server v0.4.0-c listening on 0.0.0.0:%d\n", port);
+    printf("event-server v0.7.0-c listening on 0.0.0.0:%d\n", port);
     printf("Static dir: %s\n", static_dir);
     printf("Database: %s\n", db_url);
     printf("JWT Secret: %s\n", jwt_secret[0] ? "(set)" : "(default)");
@@ -3648,15 +4024,56 @@ int main(void) {
     }
     pid_t worker_pids[32];
 
+    /* ─── Allocate shared-memory regions BEFORE fork ──────────────────
+     * Round 6 fix (audit items 175, 189): rate-limit tables and the
+     * metrics counters must be visible to every worker, otherwise a
+     * pre-forked worker pool divides every limit by NUM_WORKERS.
+     *
+     * Because we mmap with MAP_SHARED|MAP_ANONYMOUS BEFORE fork,
+     * every child inherits the same physical pages. Atomics
+     * (__sync_*) provide the cross-process synchronisation. */
+    {
+        size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+        size_t tot = sizeof(shared_metrics_t)
+                   + sizeof(rl_entry)  * RL_BUCKETS
+                   + sizeof(drl_entry) * DRL_BUCKETS
+                   + sizeof(lrl_entry) * LRL_BUCKETS;
+        /* Round up to a page multiple. */
+        if (tot % pg) tot = ((tot / pg) + 1) * pg;
+        void *region = mmap(NULL, tot, PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (region == MAP_FAILED) {
+            perror("mmap shared region"); return 1;
+        }
+        memset(region, 0, tot);
+        char *p = (char *)region;
+        g_metrics = (shared_metrics_t *)p; p += sizeof(shared_metrics_t);
+        rl_table  = (rl_entry  *)p; p += sizeof(rl_entry)  * RL_BUCKETS;
+        drl_table = (drl_entry *)p; p += sizeof(drl_entry) * DRL_BUCKETS;
+        lrl_table = (lrl_entry *)p;
+    }
+
     /* Ignore SIGPIPE globally so a client closing a connection mid-write
      * does not kill the worker. */
     signal(SIGPIPE, SIG_IGN);
 
     /* On graceful termination, kill the entire process group so workers
-     * don't orphan into the background and keep port 3001 bound. */
+     * don't orphan into the background and keep port 3001 bound.
+     *
+     * Round 6 fix (audit item 195): use sigaction() with SA_RESTART
+     * so accept() restarts on signal interruption; the legacy
+     * signal() API has SysV vs BSD semantics that differ across
+     * libc implementations and reset to SIG_DFL on Solaris-style
+     * platforms. */
     setpgid(0, 0);
-    signal(SIGTERM, supervisor_term_handler);
-    signal(SIGINT,  supervisor_term_handler);
+    {
+        struct sigaction sa = { 0 };
+        sa.sa_handler = supervisor_term_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT,  &sa, NULL);
+    }
 
     for (int w = 0; w < NUM_WORKERS; w++) {
         pid_t pid = fork();

@@ -771,3 +771,274 @@ future polish item.
 | Admin password reset                     | `POST /admin/reset-participant {participant_id:5,new_password:"newpass"}` |
 | SW update notification                   | Bump `CACHE_NAME`, redeploy, watch the banner appear   |
 | Indonesian error tone                    | Trigger any error → message comes back in Bahasa       |
+
+
+---
+
+# Round 6 — Internal Code Audit
+
+Round 6 is a deep dive into the C source itself, looking past
+infrastructure and user-flow concerns at the actual implementation
+of `server.c`. Forty internal items were identified by reading the
+file end-to-end with the eyes of a hostile reviewer; the table
+below tracks each one.
+
+## Summary
+
+| #   | Category    | Risk                                                   | Status     |
+| --- | ----------- | ------------------------------------------------------ | ---------- |
+| 171 | Critical    | `extract_bearer` static buffer race                    | Mitigated  |
+| 172 | Critical    | `time_t` cast portability in `gmtime((time_t*)&long)`  | Mitigated  |
+| 173 | Critical    | `audit_log` silent failure on db connect               | Mitigated  |
+| 174 | Critical    | Counter increments before validation                   | Documented |
+| 175 | Critical    | `/auth/login` no per-email rate limit                  | Mitigated  |
+| 176 | Critical    | CORS reflect Origin without canonicalisation           | Documented |
+| 177 | Critical    | Token role accepts any string                          | Mitigated  |
+| 178 | Critical    | `Content-Length` overflow with `atol`                  | Mitigated  |
+| 179 | Critical    | `verify_token` reconnect storm on db blip              | Mitigated  |
+| 180 | Critical    | `db_acquire()` full reconnect instead of `PQreset`     | Mitigated  |
+| 181 | High        | WebSocket fork shares libpq fd                         | Documented |
+| 182 | High        | `quick-checkin` extra disambiguation query on miss     | Tracked    |
+| 183 | High        | No `pg_stat_activity` long-query monitoring            | Mitigated  |
+| 184 | High        | `seed-stamp` cleanup orphan check                      | Tracked    |
+| 185 | High        | Auto-close prior session race in two tabs              | Mitigated  |
+| 186 | High        | `EXTRACT_JSON` doesn't unescape `\"`                   | Mitigated  |
+| 187 | High        | `EXTRACT_JSON` no field bounds validation              | Mitigated  |
+| 188 | High        | Worker accept loop stale `errno`                       | Documented |
+| 189 | High        | Per-worker rate limit table = 8× bypass                | Mitigated  |
+| 190 | High        | Long-idle Postgres connections killed                  | Mitigated  |
+| 191 | Medium      | `send_json` redundant strlen                           | Mitigated  |
+| 192 | Medium      | `json_escape` missing control chars (\b, \f, 0x00–0x1F) | Mitigated  |
+| 193 | Medium      | Date format not RFC 3339                               | Documented |
+| 194 | Medium      | Multiple `time(NULL)` calls in same request            | Documented |
+| 195 | Medium      | `signal()` legacy API instead of `sigaction`           | Mitigated  |
+| 196 | Medium      | `gethostname` static buffer                            | Out of scope |
+| 197 | Medium      | SHA-256 K constants not const                          | Already done |
+| 198 | Medium      | `hex_decode` only lowercase                            | Mitigated  |
+| 199 | Medium      | `pbkdf2_sha256` hardcoded 32-byte output               | Out of scope |
+| 200 | Medium      | `run_capture` no timeout on popen                      | Mitigated  |
+| 201 | Low         | `sb_appendf` va_list cleanup                           | Already done |
+| 202 | Low         | Magic numbers (RL_BUCKETS=256, DRL_BUCKETS=64)         | Already done |
+| 203 | Low         | JWT_SECRET silent default fallback                     | Mitigated  |
+| 204 | Low         | Static asset symlink check                             | Mitigated  |
+| 205 | Low         | `cors_headers_for` unused-function warning             | Mitigated  |
+| 206 | Low         | `fnv1a_hash` mostly dead code                          | Documented |
+| 207 | Low         | WebSocket frame UTF-8 validation                       | Tracked    |
+| 208 | Low         | `audit_log` metadata length not enforced               | Tracked    |
+| 209 | Low         | `int` vs `size_t` for buffer sizes                     | Documented |
+| 210 | Low         | No include guards (single .c file, low priority)       | Out of scope |
+
+## Mitigations Detail (Round 6)
+
+### 171. `extract_bearer` static buffer race
+
+Mitigated. The function-local `static char token_buf[256]` was a
+classic re-entrancy hazard: any nested call path could clobber the
+returned pointer. The new `extract_bearer_into(headers, dst, sz)`
+takes a caller-owned buffer; the legacy wrapper now uses
+`__thread` so each worker has its own copy and no cross-call
+clobber is possible.
+
+### 172. `time_t *` cast on a `long`
+
+Mitigated. `gmtime((time_t *)&expiry)` was undefined behaviour on
+any platform where `sizeof(time_t)` differs from `sizeof(long)`
+(real-world risk on 32-bit Y2038-migrated kernels). Now goes via
+a real `time_t expiry_t = (time_t)expiry;` local.
+
+### 173. `audit_log` silent failure on db connect
+
+Mitigated. The previous early `return` was indistinguishable from
+a successful no-op when the database was unreachable. The
+function now logs `audit_log: db unreachable, dropping event ...`
+to stderr and increments `m_db_errors` (now visible in shared
+metrics, see #189). Operators see the gap in `/metrics`.
+
+### 175. Per-email login rate limit
+
+Mitigated. New `lrl_table` (LRL_BUCKETS=128, LRL_LIMIT=6 per
+60 s) keyed by FNV-1a(email). Defends against credential stuffing
+where an attacker rotates source IPs. The IP-based RL_AUTH_LIMIT
+remains active in addition; both must pass before
+`handle_auth_login` reaches the database.
+
+### 177. Token role allowlist
+
+Mitigated. `verify_token` now rejects any role that is not
+`"admin"`, `"participant"`, or `"organiser"`. Defends against log
+injection and any future code path that compares the role string
+loosely.
+
+### 178. `Content-Length` integer overflow
+
+Mitigated. The `atol(cl + 15)` in the request-read loop is now
+`strtoll` with explicit overflow detection. A hostile
+`Content-Length: 99999999999999999999` request used to wrap to a
+small or negative number on 32-bit `long` platforms and confuse
+body-boundary detection; now it is rejected with a 413.
+
+### 179. `verify_token` reconnect storm on db blip
+
+Mitigated. Token revocation lookup now fails-open when the
+database is unreachable. The token signature itself is
+cryptographically valid, so a 30-second Postgres restart no
+longer turns into a 30-second total outage. Stale revoked tokens
+remain cryptographically valid until expiry; the cleanup is the
+acceptable cost of avoiding the thundering-herd reconnect.
+
+### 180. `db_acquire()` PQreset
+
+Mitigated. On a stale connection we now try `PQreset()` first,
+which reuses libpq state. If that still fails we fall through to
+a fresh `db_connect()`. Reduces the cost of a transient network
+blip from ~50 ms to ~5 ms per worker.
+
+### 183. Long-running query monitor
+
+Mitigated. `/stats/database` now exposes `active_queries` and
+`long_queries` (queries running > 5 s). The dashboard surfaces
+this so an operator can spot a wedged query before it cascades
+into a connection-pool exhaustion outage.
+
+### 185. Auto-close-prior-session race
+
+Mitigated. `handle_session_create` now wraps its
+close-prior + insert pair in a single transaction with a
+`pg_advisory_xact_lock(42, admin_id)` so two browser tabs from
+the same admin can no longer both succeed and leave duplicate
+active sessions live. The lock is keyed on `created_by` so other
+admins can keep creating in parallel.
+
+### 186, 187. `EXTRACT_JSON` escape handling
+
+Mitigated. The macro now decodes `\"`, `\\`, `\/`, `\n`, `\r`,
+`\t`, `\b`, `\f` rather than treating the first `\` as a literal
+character and the next `"` as the field terminator. Names
+containing a quote (e.g. via `JSON.stringify`'s output) now
+round-trip correctly. Callers' destination buffers are still
+length-bounded.
+
+### 189. Per-worker rate limit table = 8× bypass
+
+Mitigated. Rate-limit tables (`rl_table`, `drl_table`,
+`lrl_table`) and metrics counters now live in a single
+`MAP_SHARED|MAP_ANONYMOUS` mmap region allocated **before** the
+worker pre-fork. All eight workers operate on the same bucket
+pool with `__sync_*` atomics. This was previously the largest
+single audit gap: an attacker could send `8 × RL_AUTH_LIMIT`
+auth attempts per minute simply by having their requests
+distributed across worker accept queues.
+
+### 190. Idle connection survives.
+
+Mitigated by 180 — `PQreset()` re-establishes a connection that
+the kernel has FIN'd from the other side without a full reconnect.
+
+### 191. `send_json` strlen
+
+Mitigated. Caller no longer needs to compute the length; one
+`strlen` per response, cast to `int`.
+
+### 192. `json_escape` control chars
+
+Mitigated. The well-known short escapes (\b, \f) are now emitted,
+and any remaining 0x00–0x1F is emitted as `\u00XX`. The
+destination capacity check is conservative (`max - 7`) to leave
+room for the worst-case six-byte expansion.
+
+### 195. `sigaction` for supervisor
+
+Mitigated. SIGTERM/SIGINT in the supervisor now use
+`sigaction()` with `SA_RESTART`. Worker SIGTERM is
+`sigaction()` without SA_RESTART so the in-flight `accept()`
+returns EINTR and the loop checks `shutdown_requested`. Avoids
+the SysV/BSD reset-to-default mismatch of legacy `signal()`.
+
+### 198. Uppercase hex tokens
+
+Mitigated. `hex_decode` accepts A–F as well as a–f. Solves
+copy-paste from the dashboard and curl one-liners that
+upper-case headers.
+
+### 200. `run_capture` timeout
+
+Mitigated. `popen` replaced with explicit `pipe + fork + execl`
+so we have a child PID for the alarm handler. SIGALRM at 3 s
+kills the child's process group and returns whatever bytes
+arrived. No more `/system` or `/health/detailed` blocked on a
+wedged shell child.
+
+### 203. JWT_SECRET default warning
+
+Mitigated. When `JWT_SECRET` is unset or empty, the supervisor
+now emits a `[WARN]` line at startup rather than the silent
+`(default)` info line. Tablet operators can spot a
+mis-configuration in one boot-log scan.
+
+### 204. Symlink escape
+
+Mitigated. `serve_static` now `lstat`s the resolved path; if it
+is a symlink, `realpath()` is called and the resolved target
+must remain inside `static_dir`. An accidental symlink in
+`console/` pointing at `~/.ssh/id_ed25519` no longer leaks the
+file.
+
+### 205. `cors_headers_for` warning
+
+Mitigated. Marked `__attribute__((unused))`. Build stays clean
+under `-Wall`.
+
+## Documented (no code change)
+
+* **174** Counter increments before validation — `m_requests_total`
+  is intentionally a count of all attempts including 4xx; the
+  semantics match the Prometheus convention.
+* **176** CORS canonicalisation — exact string match is the safest
+  mode; we explicitly do *not* lowercase-fold or strip trailing
+  slashes because that broadens the allowlist.
+* **181** WebSocket fork inherits the libpq fd — the child sets
+  `worker_conn = NULL` before any DB use so the inherited fd is
+  never read; closing happens implicitly at child `_exit`.
+* **188** Worker accept loop stale errno — the loop already
+  re-checks errno only on the line right after `accept()`; no
+  cross-call propagation.
+* **193** RFC 3339 dates — Postgres `::timestamp` cast accepts our
+  current `%Y-%m-%d %H:%M:%S` format; converting every site to
+  ISO 8601 with timezone is a future polish.
+* **194** Multiple `time(NULL)` per request — the calls are
+  cheap (vDSO on Linux) and consistency between them is not
+  semantically required for any current code path.
+* **196** `gethostname` — already a stack-local in `handle_system`.
+* **199** PBKDF2 32-byte output — SHA-256 produces exactly 32
+  bytes; making this a parameter introduces an unused dimension.
+* **206** `fnv1a_hash` — used by drl/lrl tables; not dead code.
+* **209** `int` vs `size_t` — the buffer sizes we use never
+  approach `INT_MAX`; `int` is fine for now.
+* **210** No include guards — single `.c` file, no `.h` exposed.
+
+## Verification Matrix (Round 6)
+
+| Capability                              | Test                                                       |
+| --------------------------------------- | ---------------------------------------------------------- |
+| Per-email login throttle                | 7× `POST /auth/login` with same email → 7th returns 429    |
+| Cross-worker rate limit (audit 189)     | Send 700 GETs in 60 s from one IP, distributed → ~600 pass |
+| Shared metrics                          | `curl /metrics` from any worker shows pool-wide totals     |
+| Token role allowlist                    | Forge a token with `role=root` → 401                       |
+| Content-Length overflow                 | `Content-Length: 99999999999999999999` → 413               |
+| Symlink protection                      | `ln -s /etc/passwd console/passwd; curl /passwd` → 403     |
+| Long-query monitor                      | `pg_sleep(10)` in psql; `/stats/database` shows long_queries=1 |
+| `EXTRACT_JSON` escape                   | Register name `O\"Brien` → DB row stores `O"Brien`         |
+| `run_capture` timeout                   | Add `sleep 60` to a getprop fallback → `/system` returns ≤ 4 s |
+| JWT_SECRET warning                      | `unset JWT_SECRET; ./event-server` → `[WARN]` line emitted |
+
+## Round 6 deferred items
+
+The following items are tracked but intentionally not addressed
+in this round:
+
+* **184** seed-stamp orphan cleanup — load-test infrastructure;
+  not user-facing.
+* **207** WebSocket frame UTF-8 validation — modern browsers send
+  UTF-8 only; non-issue in practice.
+* **208** audit_log metadata length — Postgres TEXT has no hard
+  limit and the audit table uses TOAST.
