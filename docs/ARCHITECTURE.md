@@ -123,24 +123,41 @@ one cheap follow-up query.
 
 ## Rate Limiting
 
-A fixed-window per-IP token bucket lives in shared memory across the
-worker pool (each worker has its own table; rate-limited bursts are
-spread across all workers, which is acceptable since the policy is a
-soft floor).
+A fixed-window per-IP token bucket lives in shared memory (mmap'd
+with `MAP_SHARED|MAP_ANONYMOUS` before the worker pre-fork, so all
+workers operate on a single bucket pool). Atomic increments via
+`__sync_*` keep concurrent access safe. A second table tracks
+per-email login attempts and a third tracks per-device check-in
+attempts; all three share the same shared-memory region.
 
 | Path prefix       | Limit          | Reason                                            |
 | ----------------- | -------------- | ------------------------------------------------- |
-| `/auth/...`       | 10 / minute    | Anti brute-force                                  |
+| `/auth/...`       | 10 / IP / min  | Anti brute-force                                  |
+| `/auth/login`     | 6 / email / min | Anti credential stuffing across rotating IPs     |
 | `/attendance/...` | unlimited      | Primary path; venue NAT means all attendees share an IP |
+| `/attendance/quick-checkin` | 30 / device / min | Anti device-flood       |
 | `/ws/...`         | unlimited      | Long-lived; not per-request                       |
 | `/deploy/...`     | unlimited      | Authenticated by shared secret                    |
-| everything else   | 600 / minute   | Admin operations; generous default                |
+| everything else   | 600 / IP / min | Admin operations; generous default                |
 
 Returns `429 Too Many Requests` with `Retry-After: 60` when exceeded.
 
 ## Authentication and Authorisation
 
-- Bearer-token JWT with HMAC FNV-1a signature.
+- Bearer token: `id:expiry:role:hex_signature` where the signature is
+  HMAC-SHA-256 over the first three fields with the `JWT_SECRET`.
+  Legacy HMAC-SHA-1 tokens (40 hex chars) are still accepted for the
+  duration of the deploy window so in-flight sessions don't break.
+- The role is enforced against an allowlist of `admin`, `participant`,
+  `organiser`; anything else fails verification.
+- Constant-time signature comparison defeats timing attacks.
+- Revocation via `RevokedToken` table — the first 16 hex characters of
+  the signature are deny-listed until the token's natural expiry.
+- All routes that mutate state require authentication.
+- Sessions, attendance exports, and audit log require admin role.
+- The webhook secret protects deployment endpoints; rotate by setting
+  the `WEBHOOK_SECRET` environment variable in the supervisor's
+  process environment and restarting.
 - 24-hour expiry encoded in the payload.
 - `role` claim distinguishes `admin` from `participant`.
 - Device identity is established with `POST /device/link` and
@@ -148,10 +165,12 @@ Returns `429 Too Many Requests` with `Retry-After: 60` when exceeded.
   `/attendance/quick-checkin` — eliminating the JWT round trip on the
   hot path.
 
-The signature scheme is intentionally simple (FNV-1a, not HMAC-SHA-256)
-because the threat model is a closed campus event, not the public
-internet. The shared secret is rotated by editing `JWT_SECRET` in the
-process environment and restarting.
+The signature scheme is HMAC-SHA-256 with constant-time verification.
+Legacy HMAC-SHA-1 tokens are still accepted to keep in-flight
+sessions valid across a deploy window. The shared secret is rotated
+by editing `JWT_SECRET` in the process environment and restarting;
+when the variable is unset the server emits a `[WARN]` line on
+startup so the operator can spot a misconfiguration immediately.
 
 ## Storage
 

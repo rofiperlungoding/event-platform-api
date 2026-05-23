@@ -88,7 +88,7 @@ Health probe with database connectivity verification.
     "last_backup_epoch": 1779560000,
     "size_bytes": 2202
   },
-  "version": "0.5.0-c",
+  "version": "0.7.1-c",
   "node_version": "native-c"
 }
 ```
