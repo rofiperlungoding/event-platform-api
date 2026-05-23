@@ -18,6 +18,7 @@ JOBS=(
   "*/5 * * * * /data/data/com.termux/files/usr/bin/bash /data/data/com.termux/files/home/projects/event-platform-api/deploy/battery-watchdog.sh"
   "15 */6 * * * /data/data/com.termux/files/usr/bin/bash /data/data/com.termux/files/home/projects/event-platform-api/deploy/time-check.sh"
   "45 5 * * * /data/data/com.termux/files/usr/bin/bash /data/data/com.termux/files/home/projects/event-platform-api/deploy/cert-watchdog.sh"
+  "0 * * * * /data/data/com.termux/files/usr/bin/bash /data/data/com.termux/files/home/projects/event-platform-api/deploy/auth-cleanup.sh"
 )
 
 # Get existing crontab

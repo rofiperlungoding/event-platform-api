@@ -19,5 +19,6 @@ INSERT INTO _migrations (id, name) VALUES
     (1, '001_init_participant'),
     (2, '002_auth_attendance'),
     (3, '003_named_sessions'),
-    (4, '004_multi_event')
+    (4, '004_multi_event'),
+    (5, '005_audit_revocation')
 ON CONFLICT (id) DO NOTHING;

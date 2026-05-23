@@ -80,13 +80,23 @@ Health probe with database connectivity verification.
   },
   "uptime_seconds": 12345,
   "service_uptime_seconds": 5184000,
-  "version": "0.4.0-c",
+  "deploy": {
+    "last_deploy_epoch": 1779580000,
+    "git_sha": "89269cf"
+  },
+  "backup": {
+    "last_backup_epoch": 1779560000,
+    "size_bytes": 2202
+  },
+  "version": "0.5.0-c",
   "node_version": "native-c"
 }
 ```
 
 If the database check fails, `status` becomes `"degraded"` and the
-database `status` is `"error"`.
+database `status` is `"error"`. The `deploy` and `backup` sub-objects
+let operators see at a glance whether deploys are landing and whether
+the daily backup actually wrote real content.
 
 ### `GET /system`
 
@@ -315,6 +325,72 @@ Authorization: Bearer <token>
 **Errors**
 - `401` — Missing or expired token
 - `404` — User no longer exists
+
+### `POST /auth/logout`
+
+Revoke the current bearer token. The token's signature prefix is
+added to the `RevokedToken` deny-list and rejected on subsequent
+requests until the natural expiry passes. Mitigates the otherwise
+24-hour window of a leaked token.
+
+**Headers**
+```
+Authorization: Bearer <token>
+```
+
+**Response 204** (no body)
+
+**Errors**
+- `401` — Missing or expired token
+
+### `GET /admin/audit`
+
+List recent audit log entries. **Administrator access required.**
+Used by the operational dashboard to surface "who did what when".
+
+**Query parameters**
+
+| Name     | Default | Range  | Effect                                           |
+| -------- | ------- | ------ | ------------------------------------------------ |
+| `limit`  | 100     | 1–1000 | Maximum number of rows                           |
+| `action` | none    | string | Filter to a single action verb, e.g. `session.create` |
+
+**Response 200**
+```json
+[
+  {
+    "id": 42,
+    "actorId": 3,
+    "actor_email": "admin@intrivia.test",
+    "action": "session.create",
+    "target_type": "session",
+    "target_id": "12",
+    "client_ip": "192.168.100.31",
+    "metadata": "",
+    "createdAt": "2026-05-22 08:05:00"
+  }
+]
+```
+
+### `GET /health/ready`
+
+Readiness probe. Returns `200 OK` while the worker is healthy and
+ready to accept traffic; returns `503 Service Unavailable` once
+`SIGTERM` has been received or the database is unreachable.
+
+Distinct from `/health` (liveness) — the latter never returns 503
+during normal shutdown so process supervisors do not misinterpret a
+graceful stop as a crash.
+
+**Response 200**
+```json
+{ "ready": true }
+```
+
+**Response 503**
+```json
+{ "ready": false, "reason": "shutdown in progress" }
+```
 
 ---
 

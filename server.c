@@ -711,11 +711,61 @@ static int verify_token(const char *token, char *out_role) {
         return -1;
     }
 
+    /* Revocation check (audit item 91): if the first 16 hex chars of
+     * the signature appear in `RevokedToken`, deny. The lookup is
+     * cheap (indexed PK) and only runs after sig validation, so it
+     * adds zero cost to the failure path. The expired entries are
+     * naturally cleaned up by the background sweep in handle_auth_logout. */
+    if (worker_conn || (worker_conn = db_connect())) {
+        char prefix[17];
+        memcpy(prefix, provided_hex, 16);
+        prefix[16] = 0;
+        const char *p[1] = { prefix };
+        PGresult *r = PQexecParams(worker_conn,
+            "SELECT 1 FROM \"RevokedToken\" WHERE sig_prefix = $1 AND expires_at > NOW()",
+            1, NULL, p, NULL, NULL, 0);
+        int revoked = (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0);
+        PQclear(r);
+        if (revoked) return -1;
+    }
+
     if (out_role) {
         strncpy(out_role, role, 31);
         out_role[31] = 0;
     }
     return user_id;
+}
+
+/* ─── Audit log helper ──────────────────────────────────────────────
+ * Best-effort write — failures are logged to stderr but never block
+ * the request. Privileged actions (admin operations, deletes, bulk
+ * imports) call this. Mitigates audit item 92. */
+static void audit_log(int actor_id, const char *actor_email,
+                      const char *action, const char *target_type,
+                      const char *target_id, uint32_t client_ip,
+                      const char *metadata) {
+    if (!worker_conn && !(worker_conn = db_connect())) return;
+    char actor_id_str[16];
+    snprintf(actor_id_str, sizeof(actor_id_str), "%d", actor_id);
+    struct in_addr ia = { .s_addr = client_ip };
+    const char *ip_str = inet_ntoa(ia);
+    const char *params[7] = {
+        actor_id > 0 ? actor_id_str : NULL,
+        actor_email && actor_email[0] ? actor_email : NULL,
+        action,
+        target_type,
+        target_id,
+        ip_str,
+        metadata
+    };
+    PGresult *r = PQexecParams(worker_conn,
+        "INSERT INTO \"AuditLog\" (\"actorId\", actor_email, action, target_type, target_id, client_ip, metadata) "
+        "VALUES ($1::int, $2, $3, $4, $5, $6, $7)",
+        7, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(r) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "audit_log failed: %s\n", PQresultErrorMessage(r));
+    }
+    PQclear(r);
 }
 
 /* ─── Password hashing — PBKDF2-HMAC-SHA-256 with 50,000 iterations.
@@ -938,17 +988,33 @@ static void handle_health_detailed(int fd) {
         }
     }
 
+    /* Backup info — most recent gzipped dump in ~/backups/.
+     * Mitigates audit item 112 — operators see at a glance whether
+     * yesterday's backup actually wrote successful content. */
+    char backup_info[256] = "{\"last_backup\":null,\"size_bytes\":0}";
+    {
+        char cmd_out[512];
+        if (run_capture("ls -t /data/data/com.termux/files/home/backups/eventplatform_*.sql.gz 2>/dev/null | head -1", cmd_out, sizeof(cmd_out)) > 0) {
+            struct stat st;
+            if (stat(cmd_out, &st) == 0) {
+                snprintf(backup_info, sizeof(backup_info),
+                    "{\"last_backup_epoch\":%ld,\"size_bytes\":%ld}",
+                    (long)st.st_mtime, (long)st.st_size);
+            }
+        }
+    }
+
     const char *overall = strcmp(db_status, "ok") == 0 ? "healthy" : "degraded";
     snprintf(buf, sizeof(buf),
         "{\"status\":\"%s\",\"checks\":{\"api\":{\"status\":\"ok\",\"latency_ms\":%ld},"
         "\"database\":{\"status\":\"%s\",\"latency_ms\":%ld}},"
         "\"uptime_seconds\":%ld,\"service_uptime_seconds\":%ld,"
-        "\"deploy\":%s,"
-        "\"version\":\"0.4.0-c\",\"node_version\":\"native-c\"}",
+        "\"deploy\":%s,\"backup\":%s,"
+        "\"version\":\"0.5.0-c\",\"node_version\":\"native-c\"}",
         overall, api_ms, db_status, db_ms,
         (long)(time(NULL) - start_time),
         (long)(time(NULL) - service_start_time),
-        deploy_info);
+        deploy_info, backup_info);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -1272,7 +1338,16 @@ static void handle_register(int fd, const char *body) {
     send_json(fd, 201, "Created", buf);
 }
 
-static void handle_participant_delete(int fd, const char *id_str) {
+static void handle_participant_delete(int fd, const char *id_str, const char *headers, uint32_t client_ip) {
+    /* Admin-only — DELETE was previously unauthenticated, which let
+     * any caller wipe accounts. (Audit round 4.) */
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int admin_id = verify_token(token, role);
+    if (admin_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
+
     PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
@@ -1281,8 +1356,12 @@ static void handle_participant_delete(int fd, const char *id_str) {
     const char *affected = PQcmdTuples(r);
     int deleted = (affected && affected[0] != '0');
     PQclear(r); db_release(conn);
-    if (deleted) send_no_content(fd);
-    else send_json(fd, 404, "Not Found", "{\"error\":\"participant not found\"}");
+    if (deleted) {
+        audit_log(admin_id, NULL, "participant.delete", "participant", id_str, client_ip, NULL);
+        send_no_content(fd);
+    } else {
+        send_json(fd, 404, "Not Found", "{\"error\":\"participant not found\"}");
+    }
 }
 
 /* ─── Auth Endpoints ──────────────────────────────────────────────────── */
@@ -1433,7 +1512,148 @@ static void handle_auth_me(int fd, const char *headers) {
     send_json(fd, 200, "OK", buf);
 }
 
-/* ─── Session Endpoints (admin only) ──────────────────────────────────── */
+/* Logout — adds the current token's signature prefix to the
+ * revocation list. Mitigates audit item 91. The token is denied
+ * starting from the next request. The entry is cleaned up
+ * automatically once expires_at passes (cron sweep, see
+ * deploy/auth-cleanup.sh). */
+static void handle_auth_logout(int fd, const char *headers) {
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int user_id = verify_token(token, role);
+    if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
+
+    /* Extract the signature prefix and the expiry from the token */
+    int parsed_id; long expiry;
+    char parsed_role[32];
+    char hex[80] = {0};
+    if (sscanf(token, "%d:%ld:%31[^:]:%79s", &parsed_id, &expiry, parsed_role, hex) != 4) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"malformed token\"}"); return;
+    }
+    char prefix[17];
+    memcpy(prefix, hex, 16); prefix[16] = 0;
+
+    PGconn *conn = db_acquire();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+    char expiry_str[32];
+    struct tm *tm = gmtime((time_t *)&expiry);
+    strftime(expiry_str, sizeof(expiry_str), "%Y-%m-%d %H:%M:%S", tm);
+    const char *p[3] = { prefix, expiry_str, "logout" };
+    PGresult *r = PQexecParams(conn,
+        "INSERT INTO \"RevokedToken\" (sig_prefix, expires_at, reason) VALUES ($1, $2::timestamp, $3) "
+        "ON CONFLICT (sig_prefix) DO NOTHING",
+        3, NULL, p, NULL, NULL, 0);
+    PQclear(r); db_release(conn);
+    audit_log(user_id, NULL, "auth.logout", "token", prefix, 0, NULL);
+    send_json(fd, 204, "No Content", "");
+}
+
+/* Audit log query — admin-only. Latest 100 entries by default,
+ * filterable by ?action=session.create&actor=42. */
+static void handle_admin_audit(int fd, const char *headers, const char *path) {
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int user_id = verify_token(token, role);
+    if (user_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin only\"}"); return; }
+
+    /* Parse ?limit, ?action filters from path query */
+    int limit = 100;
+    char action_filter[64] = "";
+    const char *q = strchr(path, '?');
+    if (q) {
+        const char *l = strstr(q, "limit=");
+        if (l) { int v = atoi(l + 6); if (v > 0 && v <= 1000) limit = v; }
+        const char *a = strstr(q, "action=");
+        if (a) {
+            a += 7;
+            int i = 0;
+            while (*a && *a != '&' && i < (int)sizeof(action_filter)-1) {
+                if ((*a >= 'a' && *a <= 'z') || (*a >= 'A' && *a <= 'Z') ||
+                    *a == '.' || *a == '_' || *a == '-')
+                    action_filter[i++] = *a;
+                a++;
+            }
+            action_filter[i] = 0;
+        }
+    }
+
+    PGconn *conn = db_acquire();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+    char limit_str[16]; snprintf(limit_str, sizeof(limit_str), "%d", limit);
+
+    PGresult *r;
+    if (action_filter[0]) {
+        const char *p[2] = { action_filter, limit_str };
+        r = PQexecParams(conn,
+            "SELECT id, \"actorId\", actor_email, action, target_type, target_id, "
+            "client_ip, metadata, \"createdAt\" FROM \"AuditLog\" "
+            "WHERE action = $1 ORDER BY \"createdAt\" DESC LIMIT $2::int",
+            2, NULL, p, NULL, NULL, 0);
+    } else {
+        const char *p[1] = { limit_str };
+        r = PQexecParams(conn,
+            "SELECT id, \"actorId\", actor_email, action, target_type, target_id, "
+            "client_ip, metadata, \"createdAt\" FROM \"AuditLog\" "
+            "ORDER BY \"createdAt\" DESC LIMIT $1::int",
+            1, NULL, p, NULL, NULL, 0);
+    }
+
+    strbuf sb; sb_init(&sb, 4096);
+    sb_append(&sb, "[");
+    if (PQresultStatus(r) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(r); i++) {
+            char ee[256], em[1024];
+            json_escape(ee, sizeof(ee), PQgetvalue(r, i, 2));
+            json_escape(em, sizeof(em), PQgetvalue(r, i, 7));
+            if (i > 0) sb_append(&sb, ",");
+            sb_appendf(&sb,
+                "{\"id\":%s,\"actorId\":%s,\"actor_email\":\"%s\",\"action\":\"%s\","
+                "\"target_type\":\"%s\",\"target_id\":\"%s\",\"client_ip\":\"%s\","
+                "\"metadata\":\"%s\",\"createdAt\":\"%s\"}",
+                PQgetvalue(r, i, 0), PQgetvalue(r, i, 1), ee,
+                PQgetvalue(r, i, 3), PQgetvalue(r, i, 4),
+                PQgetvalue(r, i, 5), PQgetvalue(r, i, 6),
+                em, PQgetvalue(r, i, 8));
+        }
+    }
+    PQclear(r); db_release(conn);
+    sb_append(&sb, "]");
+    send_json(fd, 200, "OK", sb.data);
+    sb_free(&sb);
+}
+
+/* Readiness probe — separate from /health.
+ * Returns 503 once shutdown_requested is set, even if the worker is
+ * still alive. Mitigates audit item 117 — gives load balancers
+ * (or the watchdog) a clean signal to drain traffic before the
+ * process actually exits. */
+static void handle_health_ready(int fd) {
+    if (shutdown_requested) {
+        send_json(fd, 503, "Service Unavailable",
+            "{\"ready\":false,\"reason\":\"shutdown in progress\"}");
+        return;
+    }
+    PGconn *conn = db_acquire();
+    if (!conn) {
+        send_json(fd, 503, "Service Unavailable",
+            "{\"ready\":false,\"reason\":\"database unavailable\"}");
+        return;
+    }
+    PGresult *r = PQexec(conn, "SELECT 1");
+    int ok = (PQresultStatus(r) == PGRES_TUPLES_OK);
+    PQclear(r); db_release(conn);
+    if (!ok) {
+        send_json(fd, 503, "Service Unavailable",
+            "{\"ready\":false,\"reason\":\"database query failed\"}");
+        return;
+    }
+    send_json(fd, 200, "OK", "{\"ready\":true}");
+}
+
+/* Session Endpoints (admin only) ──────────────────────────────────── */
 
 static void handle_session_create(int fd, const char *headers) {
     const char *token = extract_bearer(headers);
@@ -1474,7 +1694,11 @@ static void handle_session_create(int fd, const char *headers) {
     snprintf(buf, sizeof(buf),
         "{\"id\":%s,\"code\":\"%s\",\"signed_code\":\"%s\",\"expires_at\":\"%s\"}",
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), signed_code, PQgetvalue(r, 0, 2));
+    char session_id_str[16];
+    strncpy(session_id_str, PQgetvalue(r, 0, 0), sizeof(session_id_str)-1);
+    session_id_str[sizeof(session_id_str)-1] = 0;
     PQclear(r); db_release(conn);
+    audit_log(user_id, NULL, "session.create", "session", session_id_str, 0, NULL);
     send_json(fd, 201, "Created", buf);
 }
 
@@ -2884,8 +3108,13 @@ static void handle_request(int fd, const char *method, const char *path,
     if (strcmp(method, "GET") == 0) {
         if (strcmp(path, "/health") == 0) { handle_health(fd); return; }
         if (strcmp(path, "/health/detailed") == 0) { handle_health_detailed(fd); return; }
+        if (strcmp(path, "/health/ready") == 0) { handle_health_ready(fd); return; }
         if (strcmp(path, "/metrics") == 0) { handle_metrics(fd); return; }
         if (strcmp(path, "/system") == 0) { handle_system(fd); return; }
+        if (strcmp(path, "/admin/audit") == 0 ||
+            strncmp(path, "/admin/audit?", 13) == 0) {
+            handle_admin_audit(fd, headers, path); return;
+        }
         if (strcmp(path, "/stats/database") == 0) { handle_stats_database(fd); return; }
         if (strcmp(path, "/stats/participants") == 0) { handle_stats_participants(fd); return; }
         if (strcmp(path, "/events") == 0) { handle_events_list(fd); return; }
@@ -2964,6 +3193,7 @@ static void handle_request(int fd, const char *method, const char *path,
         /* Auth */
         if (strcmp(path, "/auth/register") == 0) { handle_auth_register(fd, body); return; }
         if (strcmp(path, "/auth/login") == 0) { handle_auth_login(fd, body); return; }
+        if (strcmp(path, "/auth/logout") == 0) { handle_auth_logout(fd, headers); return; }
         /* Sessions */
         if (strcmp(path, "/sessions/create") == 0) { handle_session_create(fd, headers); return; }
         if (strcmp(path, "/sessions/scheduled") == 0) { handle_session_scheduled(fd, headers, body); return; }
@@ -3017,7 +3247,7 @@ static void handle_request(int fd, const char *method, const char *path,
 
     /* ── DELETE routes ── */
     if (strcmp(method, "DELETE") == 0 && strncmp(path, "/participants/", 14) == 0) {
-        handle_participant_delete(fd, path + 14);
+        handle_participant_delete(fd, path + 14, headers, 0);
         return;
     }
 

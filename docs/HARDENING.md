@@ -419,3 +419,163 @@ multi-tenant operation becomes a goal.
 | CSV with quoted commas               | `POST /participants/bulk` with `"Doe, John",doe@...` |
 | Security headers present             | `curl -I /health \| grep -i x-frame`  |
 | 5,000 chaos with hardening           | `node loadtest/chaos-checkin.js 5000` → 100 % recoverable |
+
+
+---
+
+# Round 4 — Edge Cases, Race Conditions, Recovery
+
+## Summary
+
+| #   | Risk                                                  | Status     |
+| --- | ----------------------------------------------------- | ---------- |
+| 91  | Token revocation impossible (stateless JWT)           | Mitigated  |
+| 92  | No audit log for admin actions                        | Mitigated  |
+| 93  | Race: simultaneous session creation                   | Documented |
+| 94  | Race: device_uuid collision on register               | Documented |
+| 95  | Race: stampede during admin DB cleanup                | Documented |
+| 96  | Dashboard polls /participants too aggressively        | Mitigated  |
+| 97  | Postgres read-only on disk-full                       | Mitigated  |
+| 98  | WAL replay on crash slows startup                     | Documented |
+| 99  | No "pause attendance" control                         | Tracked    |
+| 100 | Admin password never expired                          | Documented |
+| 101 | Event slug not enforced unique cross-tenant           | Tracked    |
+| 102 | Session expiry uses server-side clock only            | Mitigated  |
+| 103 | Dashboard polling continues in background tab         | Tracked    |
+| 104 | PWA scanner has no manual code entry fallback         | Tracked    |
+| 105 | No indication QR is current vs stale                  | Tracked    |
+| 106 | Mass failure on same phone brand                      | Mitigated  |
+| 107 | Supabase replication eats bandwidth                   | Documented |
+| 108 | WebSocket forks accumulate                            | Documented |
+| 109 | Missing SIGCHLD reaping for crashed WS                | Documented |
+| 110 | CSV bulk doesn't validate email                       | Tracked    |
+| 111 | pg_stat resets on restart                             | Accepted   |
+| 112 | Dashboard hides backup status                         | Mitigated  |
+| 113 | PWA does not pre-validate signed_code locally         | Documented |
+| 114 | No date-range filter on attendance list               | Tracked    |
+| 115 | Tunnel pinned to single connector                     | Documented |
+| 116 | No structured request logging visible                 | Mitigated  |
+| 117 | No /health/ready (Kubernetes-style)                   | Mitigated  |
+| 118 | /metrics counters under-report (per-worker)           | Accepted   |
+| 119 | No version endpoint                                   | Mitigated  |
+| 120 | No ETag / 304 on static assets                        | Tracked    |
+| 121 | PWA doesn't warn about un-activated SW                | Tracked    |
+| 122 | No structured event log table                         | Mitigated  |
+| 123 | Admin participant list has no search                  | Tracked    |
+| 124 | CSV export doesn't escape commas in name              | Tracked    |
+| 125 | replicate-supabase has no dry-run                     | Tracked    |
+| 126 | Stampede tests share ID space with prod               | Documented |
+| 127 | No graceful degraded UI mode                          | Tracked    |
+| 128 | No maintenance page                                   | Tracked    |
+| 129 | Admin can't extend session expiry mid-session         | Tracked    |
+| 130 | No third role beyond admin/participant                | Tracked    |
+
+## Mitigations Detail
+
+### 91. Token revocation list
+
+`migrations/005_audit_revocation.sql` creates `RevokedToken` with the
+first 16 hex characters of the HMAC tag as the primary key. New
+endpoint `POST /auth/logout` adds the current token's prefix to the
+list with `expires_at` matching the token's natural expiry.
+`verify_token()` consults the list after signature validation; a
+revoked token returns `-1` (same as expired).
+
+`deploy/auth-cleanup.sh` runs hourly and removes entries past their
+`expires_at` so the table cannot grow unbounded.
+
+### 92, 122. Audit log
+
+`AuditLog` table records `actorId`, `actor_email`, `action`,
+`target_type`, `target_id`, `client_ip`, `metadata`, `createdAt`.
+The `audit_log()` helper is called from privileged paths:
+
+- `session.create`
+- `participant.delete` (now also requires admin auth — that was
+  previously unauthenticated, a critical bug discovered during this
+  round of audit)
+- `auth.logout`
+
+Future privileged actions should call `audit_log()` immediately
+before sending the success response. The table is queryable via
+`GET /admin/audit?limit=200&action=session.create` (admin only).
+
+### 93. Simultaneous session creation
+
+Documented. The QR generator UI in `attend/admin.html` defaults to
+showing one session at a time. Two admins both clicking "create"
+will each get a unique session code — both valid — and attendees
+who scan one will not match the other. Operators avoid this by
+having a single designated session-issuer per event.
+
+### 94. Device collision on register
+
+Documented. `Device(device_uuid)` has a UNIQUE constraint and
+`POST /device/link` uses `ON CONFLICT (device_uuid) DO UPDATE`,
+which idempotently re-binds. The race window is harmless: the
+second writer simply replaces the first writer's binding.
+
+### 96. /participants polling
+
+Mitigated. Dashboard already calls `?limit=200` (R2 #4). Round 4
+doesn't change this; for events larger than 200 the dashboard pages
+in 200-row chunks but the visible-by-default top is the most recent.
+
+### 97. Postgres disk-full
+
+Mitigated. The new `/health/ready` endpoint runs a real `SELECT 1`
+which fails on read-only mode (or read-only filesystem). The
+watchdog already escalates 5xx → rollback. Combined with disk
+monitoring in `/system`, the operator gets a clear failure signal.
+
+### 102. Server-side clock authority
+
+Mitigated. The PWA reads `server_time` from `/health` on every
+endpoint probe and refuses an endpoint with > 60 s drift from the
+local clock (item 76 mitigation, R3). The session expiry on the
+server is therefore always authoritative; the PWA only enforces
+reasonable bounds.
+
+### 106. Mass-failure recovery
+
+Mitigated. The opportunistic 15-second drain (R3 #15) plus the
+multi-LAN failover (R3 #5) means even 500 simultaneously-recovered
+devices drain in two batches via `/attendance/batch-checkin`.
+
+### 112. Backup status in /health
+
+Mitigated. `/health/detailed` now includes a `backup` object with
+`last_backup_epoch` and `size_bytes`. The dashboard surfaces "Last
+backup: 4 hours ago, 2.1 KB" so a failed backup is visible at a
+glance.
+
+### 116. Structured request logging
+
+Mitigated by the audit log (item 92). Privileged actions land in
+`AuditLog` and are queryable via `/admin/audit`. Request-level
+structured logging for non-privileged paths (every check-in) is
+deferred — the existing 4xx/5xx counters in `/metrics` cover the
+needed signal.
+
+### 117. /health/ready
+
+Mitigated. New `GET /health/ready` returns `200 OK
+{"ready":true}` while the worker is healthy, and `503` once
+`shutdown_requested` is set or the database is unreachable. Useful
+for both downstream load balancers and the operator's "is this
+deploy live?" check.
+
+### 119. Version endpoint
+
+Mitigated. `/health/detailed` already reports `version` (now
+`0.5.0-c` after this round). The dashboard has always shown it.
+
+## Verification (Round 4)
+
+| Capability                            | Test                                                |
+| ------------------------------------- | --------------------------------------------------- |
+| Token revocation                      | `POST /auth/logout` then re-use token → 401         |
+| Audit log entry                       | `POST /sessions/create` then `GET /admin/audit?limit=1` |
+| Admin-only DELETE                     | `DELETE /participants/123` without token → 401      |
+| Backup info in detailed health        | `curl /health/detailed | jq .backup`                |
+| Readiness during shutdown             | `pm2 stop event-server` then `curl /health/ready` → 503 |
