@@ -30,3 +30,5 @@ CREATE INDEX IF NOT EXISTS idx_participant_event ON "Participant"(event_id);
 INSERT INTO "Event" (slug, name, description, "createdAt")
 VALUES ('legacy', 'Legacy Data', 'Imported from pre-multi-event installation', NOW())
 ON CONFLICT (slug) DO NOTHING;
+
+INSERT INTO _migrations (id, name) VALUES (4, '004_multi_event') ON CONFLICT (id) DO NOTHING;

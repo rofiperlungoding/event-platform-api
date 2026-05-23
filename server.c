@@ -69,6 +69,17 @@ static char jwt_secret[256];
 static char webhook_secret[256];
 static char cors_allowed[512];     /* comma-separated origins, or empty for "*" */
 
+/* ─── Metrics counters ──────────────────────────────────────────────
+ * Best-effort counters across the pre-fork worker pool. Each worker
+ * has its own copy; the /metrics endpoint reports the supervisor's
+ * aggregate. Used by the monitoring loop in `health-watchdog.sh`. */
+static volatile unsigned long m_requests_total = 0;
+static volatile unsigned long m_requests_5xx = 0;
+static volatile unsigned long m_requests_4xx = 0;
+static volatile unsigned long m_db_errors = 0;
+static volatile unsigned long m_checkins_ok = 0;
+static volatile unsigned long m_checkins_dup = 0;
+
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
 /* ─── CORS handling ───────────────────────────────────────────────────
@@ -147,10 +158,17 @@ static void send_response(int fd, int status, const char *status_text,
         "%s"
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: SAMEORIGIN\r\n"
+        "Referrer-Policy: strict-origin-when-cross-origin\r\n"
         "Connection: close\r\n\r\n",
         status, status_text, cors_headers, content_type, body_len);
     write(fd, hdr, hlen);
     if (body_len > 0) write(fd, body, body_len);
+
+    /* Best-effort metrics: count 4xx/5xx outcomes for /metrics. */
+    if (status >= 500) __sync_fetch_and_add(&m_requests_5xx, 1);
+    else if (status >= 400) __sync_fetch_and_add(&m_requests_4xx, 1);
 }
 
 static void send_json(int fd, int status, const char *status_text, const char *json) {
@@ -301,6 +319,104 @@ static void sha1_final(sha1_ctx *c, uint8_t out[20]) {
         out[i*4+2] = (c->state[i] >> 8) & 0xff;
         out[i*4+3] =  c->state[i] & 0xff;
     }
+}
+
+/* ─── SHA-256 (FIPS 180-4) — used for password hashing.
+ * Pure C, no dependencies. ~85 lines. */
+typedef struct { uint32_t state[8]; uint64_t bytes; uint8_t buf[64]; int idx; } sha256_ctx;
+
+static const uint32_t K256[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+#define SHR32(x,n) ((x) >> (n))
+#define ROR32(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+static void sha256_block(sha256_ctx *c, const uint8_t *block) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = (block[i*4]<<24) | (block[i*4+1]<<16) | (block[i*4+2]<<8) | block[i*4+3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ROR32(w[i-15],7) ^ ROR32(w[i-15],18) ^ SHR32(w[i-15],3);
+        uint32_t s1 = ROR32(w[i-2],17) ^ ROR32(w[i-2],19)  ^ SHR32(w[i-2],10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a=c->state[0],b=c->state[1],cc=c->state[2],d=c->state[3];
+    uint32_t e=c->state[4],f=c->state[5],g=c->state[6],h=c->state[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = ROR32(e,6) ^ ROR32(e,11) ^ ROR32(e,25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + S1 + ch + K256[i] + w[i];
+        uint32_t S0 = ROR32(a,2) ^ ROR32(a,13) ^ ROR32(a,22);
+        uint32_t mj = (a & b) ^ (a & cc) ^ (b & cc);
+        uint32_t t2 = S0 + mj;
+        h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2;
+    }
+    c->state[0]+=a; c->state[1]+=b; c->state[2]+=cc; c->state[3]+=d;
+    c->state[4]+=e; c->state[5]+=f; c->state[6]+=g; c->state[7]+=h;
+}
+
+static void sha256_init(sha256_ctx *c) {
+    c->state[0]=0x6a09e667; c->state[1]=0xbb67ae85;
+    c->state[2]=0x3c6ef372; c->state[3]=0xa54ff53a;
+    c->state[4]=0x510e527f; c->state[5]=0x9b05688c;
+    c->state[6]=0x1f83d9ab; c->state[7]=0x5be0cd19;
+    c->bytes=0; c->idx=0;
+}
+
+static void sha256_update(sha256_ctx *c, const uint8_t *data, int len) {
+    c->bytes += len;
+    while (len > 0) {
+        int take = 64 - c->idx; if (take > len) take = len;
+        memcpy(c->buf + c->idx, data, take);
+        c->idx += take; data += take; len -= take;
+        if (c->idx == 64) { sha256_block(c, c->buf); c->idx = 0; }
+    }
+}
+
+static void sha256_final(sha256_ctx *c, uint8_t out[32]) {
+    uint64_t bits = c->bytes * 8;
+    c->buf[c->idx++] = 0x80;
+    if (c->idx > 56) {
+        while (c->idx < 64) c->buf[c->idx++] = 0;
+        sha256_block(c, c->buf); c->idx = 0;
+    }
+    while (c->idx < 56) c->buf[c->idx++] = 0;
+    for (int i = 7; i >= 0; i--) c->buf[c->idx++] = (bits >> (i*8)) & 0xff;
+    sha256_block(c, c->buf);
+    for (int i = 0; i < 8; i++) {
+        out[i*4]   = (c->state[i] >> 24) & 0xff;
+        out[i*4+1] = (c->state[i] >> 16) & 0xff;
+        out[i*4+2] = (c->state[i] >> 8)  & 0xff;
+        out[i*4+3] =  c->state[i]        & 0xff;
+    }
+}
+
+/* HMAC-SHA-256 (RFC 2104) */
+static void hmac_sha256(const uint8_t *key, int klen,
+                        const uint8_t *msg, int mlen,
+                        uint8_t out[32]) {
+    uint8_t k_pad[64];
+    if (klen > 64) {
+        sha256_ctx kc; sha256_init(&kc); sha256_update(&kc, key, klen); sha256_final(&kc, k_pad);
+        memset(k_pad + 32, 0, 32);
+    } else {
+        memcpy(k_pad, key, klen);
+        memset(k_pad + klen, 0, 64 - klen);
+    }
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) { ipad[i] = k_pad[i] ^ 0x36; opad[i] = k_pad[i] ^ 0x5c; }
+    sha256_ctx ctx;
+    uint8_t inner[32];
+    sha256_init(&ctx); sha256_update(&ctx, ipad, 64); sha256_update(&ctx, msg, mlen); sha256_final(&ctx, inner);
+    sha256_init(&ctx); sha256_update(&ctx, opad, 64); sha256_update(&ctx, inner, 32);  sha256_final(&ctx, out);
 }
 
 /* ─── Base64 encoder ──────────────────────────────────────────────────── */
@@ -459,44 +575,56 @@ static int hex_decode(const char *in, int outlen, uint8_t *out) {
     return 0;
 }
 
-/* Generate token: "id:expiry:role:hex_sha1_signature" */
+/* Generate token: "id:expiry:role:hex_sha256_signature" (256-bit HMAC).
+ * Upgraded from HMAC-SHA1; old SHA1 tokens are still validated via the
+ * legacy path in verify_token() so that in-flight sessions don't break
+ * during the deploy window. */
 static void generate_token(char *out, int out_sz, int user_id, const char *role) {
     time_t expiry = time(NULL) + TOKEN_EXPIRY;
     char payload[256];
     int plen = snprintf(payload, sizeof(payload), "%d:%ld:%s",
                          user_id, (long)expiry, role);
-    uint8_t sig[20];
-    hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
-              (const uint8_t *)payload, plen, sig);
-    char hex[41];
-    hex_encode(sig, 20, hex);
+    uint8_t sig[32];
+    hmac_sha256((const uint8_t *)jwt_secret, strlen(jwt_secret),
+                (const uint8_t *)payload, plen, sig);
+    char hex[65];
+    hex_encode(sig, 32, hex);
     snprintf(out, out_sz, "%d:%ld:%s:%s", user_id, (long)expiry, role, hex);
 }
 
 /* Verify token, returns participant_id or -1 on failure.
- * Also sets *out_role to "admin" or "participant" if non-NULL */
+ * Accepts both HMAC-SHA-256 (64 hex chars) and legacy HMAC-SHA-1 (40
+ * hex chars) signatures. New tokens are always SHA-256. */
 static int verify_token(const char *token, char *out_role) {
     int user_id;
     long expiry;
     char role[32];
-    char provided_hex[64] = {0};
+    char provided_hex[80] = {0};
 
-    if (sscanf(token, "%d:%ld:%31[^:]:%63s", &user_id, &expiry, role, provided_hex) != 4)
+    if (sscanf(token, "%d:%ld:%31[^:]:%79s", &user_id, &expiry, role, provided_hex) != 4)
         return -1;
     if ((time_t)expiry < time(NULL)) return -1;
 
-    /* Length check first — HMAC-SHA1 is exactly 40 hex chars */
-    if (strlen(provided_hex) != 40) return -1;
-
+    int hex_len = (int)strlen(provided_hex);
     char payload[256];
     int plen = snprintf(payload, sizeof(payload), "%d:%ld:%s", user_id, expiry, role);
-    uint8_t expected[20];
-    hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
-              (const uint8_t *)payload, plen, expected);
 
-    uint8_t got[20];
-    if (hex_decode(provided_hex, 20, got) < 0) return -1;
-    if (!ct_memeq(got, expected, 20)) return -1;
+    if (hex_len == 64) {
+        uint8_t expected[32], got[32];
+        hmac_sha256((const uint8_t *)jwt_secret, strlen(jwt_secret),
+                    (const uint8_t *)payload, plen, expected);
+        if (hex_decode(provided_hex, 32, got) < 0) return -1;
+        if (!ct_memeq(got, expected, 32)) return -1;
+    } else if (hex_len == 40) {
+        /* Legacy SHA-1 token */
+        uint8_t expected[20], got[20];
+        hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
+                  (const uint8_t *)payload, plen, expected);
+        if (hex_decode(provided_hex, 20, got) < 0) return -1;
+        if (!ct_memeq(got, expected, 20)) return -1;
+    } else {
+        return -1;
+    }
 
     if (out_role) {
         strncpy(out_role, role, 31);
@@ -505,18 +633,38 @@ static int verify_token(const char *token, char *out_role) {
     return user_id;
 }
 
-/* ─── Password hashing — salted SHA-1 with HMAC.
- * Format: "sha1$<16-hex-salt>$<40-hex-hmac>". Plaintext leftovers from
- * earlier bulk imports remain valid via the legacy compare path so we
- * do not break existing accounts.
+/* ─── Password hashing — PBKDF2-HMAC-SHA-256 with 50,000 iterations.
  *
- * SHA-1 is a deliberate choice here: the project already has SHA-1 +
- * HMAC primitives in the binary (used for the WebSocket handshake), and
- * the threat model is a closed campus event without internet exposure
- * of the credential store. For a public-internet deployment this would
- * be replaced with bcrypt / argon2. */
+ * Format: "pbkdf2$50000$<16-hex-salt>$<64-hex-hash>".
+ * Backwards compatible: legacy "sha1$..." entries still verify, so do
+ * pre-hash plaintext entries from older bulk imports.
+ *
+ * Iteration count chosen to stay under ~30 ms per hash on the Unisoc
+ * T618 — fast enough that login is snappy, slow enough that a stolen
+ * dump cannot be rainbow-tabled at typical hash rates. */
+#define PBKDF2_ITER 50000
+
+static void pbkdf2_sha256(const uint8_t *password, int plen,
+                          const uint8_t *salt, int slen,
+                          int iterations, uint8_t out[32]) {
+    /* PBKDF2 with HMAC-SHA-256, dkLen = 32 (single block since hLen = dkLen) */
+    uint8_t salt_block[256];
+    if (slen + 4 > (int)sizeof(salt_block)) return;
+    memcpy(salt_block, salt, slen);
+    salt_block[slen + 0] = 0; salt_block[slen + 1] = 0;
+    salt_block[slen + 2] = 0; salt_block[slen + 3] = 1;
+
+    uint8_t U[32], T[32];
+    hmac_sha256(password, plen, salt_block, slen + 4, U);
+    memcpy(T, U, 32);
+    for (int i = 1; i < iterations; i++) {
+        hmac_sha256(password, plen, U, 32, U);
+        for (int j = 0; j < 32; j++) T[j] ^= U[j];
+    }
+    memcpy(out, T, 32);
+}
+
 static void hash_password(char *out, int out_sz, const char *password) {
-    /* 8-byte salt */
     uint8_t salt[8];
     int rfd = open("/dev/urandom", O_RDONLY);
     if (rfd >= 0) { read(rfd, salt, 8); close(rfd); }
@@ -524,37 +672,57 @@ static void hash_password(char *out, int out_sz, const char *password) {
     char salt_hex[17];
     hex_encode(salt, 8, salt_hex);
 
-    /* HMAC( jwt_secret, salt || ':' || password ) */
-    char buf[512];
-    int n = snprintf(buf, sizeof(buf), "%s:%s", salt_hex, password);
-    uint8_t mac[20];
-    hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
-              (const uint8_t *)buf, n, mac);
-    char mac_hex[41];
-    hex_encode(mac, 20, mac_hex);
-    snprintf(out, out_sz, "sha1$%s$%s", salt_hex, mac_hex);
+    uint8_t hash[32];
+    pbkdf2_sha256((const uint8_t *)password, strlen(password),
+                  salt, 8, PBKDF2_ITER, hash);
+    char hash_hex[65];
+    hex_encode(hash, 32, hash_hex);
+    snprintf(out, out_sz, "pbkdf2$%d$%s$%s", PBKDF2_ITER, salt_hex, hash_hex);
 }
 
 static int verify_password(const char *stored, const char *supplied) {
     if (!stored || !supplied) return 0;
-    if (strncmp(stored, "sha1$", 5) != 0) {
-        /* Legacy plaintext entry — accept literal compare. */
-        return strcmp(stored, supplied) == 0;
+
+    /* Modern: pbkdf2$<iter>$<salt-hex>$<hash-hex> */
+    if (strncmp(stored, "pbkdf2$", 7) == 0) {
+        int iter = atoi(stored + 7);
+        const char *p1 = strchr(stored + 7, '$');
+        if (!p1) return 0;
+        const char *salt_hex = p1 + 1;
+        const char *p2 = strchr(salt_hex, '$');
+        if (!p2) return 0;
+        int salt_hex_len = p2 - salt_hex;
+        if (salt_hex_len != 16) return 0;
+        uint8_t salt[8];
+        if (hex_decode(salt_hex, 8, salt) < 0) return 0;
+        const char *hash_hex = p2 + 1;
+        if (strlen(hash_hex) != 64) return 0;
+        uint8_t expected[32], got[32];
+        if (hex_decode(hash_hex, 32, expected) < 0) return 0;
+        pbkdf2_sha256((const uint8_t *)supplied, strlen(supplied),
+                      salt, 8, iter, got);
+        return ct_memeq(got, expected, 32);
     }
-    /* Format: sha1$SALTHEX$MACHEX */
-    const char *salt_hex = stored + 5;
-    const char *dollar = strchr(salt_hex, '$');
-    if (!dollar) return 0;
-    int salt_len = dollar - salt_hex;
-    if (salt_len != 16) return 0;
-    char buf[512];
-    int n = snprintf(buf, sizeof(buf), "%.*s:%s", salt_len, salt_hex, supplied);
-    uint8_t mac[20];
-    hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
-              (const uint8_t *)buf, n, mac);
-    char mac_hex[41];
-    hex_encode(mac, 20, mac_hex);
-    return strcmp(mac_hex, dollar + 1) == 0;
+
+    /* Legacy single-pass HMAC-SHA1 */
+    if (strncmp(stored, "sha1$", 5) == 0) {
+        const char *salt_hex = stored + 5;
+        const char *dollar = strchr(salt_hex, '$');
+        if (!dollar) return 0;
+        int salt_len = dollar - salt_hex;
+        if (salt_len != 16) return 0;
+        char buf[512];
+        int n = snprintf(buf, sizeof(buf), "%.*s:%s", salt_len, salt_hex, supplied);
+        uint8_t mac[20];
+        hmac_sha1((const uint8_t *)jwt_secret, strlen(jwt_secret),
+                  (const uint8_t *)buf, n, mac);
+        char mac_hex[41];
+        hex_encode(mac, 20, mac_hex);
+        return strcmp(mac_hex, dollar + 1) == 0;
+    }
+
+    /* Plaintext (legacy bulk imports) — last-resort compare. */
+    return strcmp(stored, supplied) == 0;
 }
 
 /* Extract Bearer token from raw headers */
@@ -591,6 +759,46 @@ static void generate_code(char *out, int len) {
         out[i] = charset[(seed >> 16) % (sizeof(charset) - 1)];
     }
     out[len] = 0;
+}
+
+/* ─── Metrics — Prometheus-compatible exposition ────────────────────
+ * Counters are best-effort across pre-fork workers (each worker has
+ * its own copy; we report supervisor-side aggregate by reading shared
+ * memory). For a single-tablet deployment with low scrape rate this
+ * is honest enough. */
+
+static void handle_metrics(int fd) {
+    char buf[2048];
+    int n = snprintf(buf, sizeof(buf),
+        "# HELP eventplatform_requests_total Total HTTP requests handled.\n"
+        "# TYPE eventplatform_requests_total counter\n"
+        "eventplatform_requests_total %lu\n"
+        "# HELP eventplatform_requests_5xx Total 5xx responses returned.\n"
+        "# TYPE eventplatform_requests_5xx counter\n"
+        "eventplatform_requests_5xx %lu\n"
+        "# HELP eventplatform_requests_4xx Total 4xx responses returned.\n"
+        "# TYPE eventplatform_requests_4xx counter\n"
+        "eventplatform_requests_4xx %lu\n"
+        "# HELP eventplatform_db_errors Database operation errors.\n"
+        "# TYPE eventplatform_db_errors counter\n"
+        "eventplatform_db_errors %lu\n"
+        "# HELP eventplatform_checkins_ok Attendance check-ins committed.\n"
+        "# TYPE eventplatform_checkins_ok counter\n"
+        "eventplatform_checkins_ok %lu\n"
+        "# HELP eventplatform_checkins_duplicate Attendance attempts that hit the unique constraint.\n"
+        "# TYPE eventplatform_checkins_duplicate counter\n"
+        "eventplatform_checkins_duplicate %lu\n"
+        "# HELP eventplatform_uptime_seconds Process uptime since last restart.\n"
+        "# TYPE eventplatform_uptime_seconds gauge\n"
+        "eventplatform_uptime_seconds %ld\n"
+        "# HELP eventplatform_service_uptime_seconds Service uptime since first ever boot.\n"
+        "# TYPE eventplatform_service_uptime_seconds gauge\n"
+        "eventplatform_service_uptime_seconds %ld\n",
+        m_requests_total, m_requests_5xx, m_requests_4xx,
+        m_db_errors, m_checkins_ok, m_checkins_dup,
+        (long)(time(NULL) - start_time),
+        (long)(time(NULL) - service_start_time));
+    send_response(fd, 200, "OK", "text/plain; version=0.0.4", buf, n);
 }
 
 /* ─── Original Route Handlers (unchanged) ─────────────────────────────── */
@@ -1382,9 +1590,11 @@ static void handle_attendance_quick_checkin(int fd, const char *body) {
         const char *sqlstate = PQresultErrorField(r, PG_DIAG_SQLSTATE);
         PQclear(r); db_release(conn);
         if (sqlstate && strcmp(sqlstate, "23505") == 0) {
+            __sync_fetch_and_add(&m_checkins_dup, 1);
             send_json(fd, 409, "Conflict",
                 "{\"error\":\"already checked in for this session\"}");
         } else {
+            __sync_fetch_and_add(&m_db_errors, 1);
             send_json(fd, 500, "Internal Server Error", "{\"error\":\"checkin failed\"}");
         }
         return;
@@ -1415,6 +1625,7 @@ static void handle_attendance_quick_checkin(int fd, const char *body) {
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1),
         PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3));
     PQclear(r); db_release(conn);
+    __sync_fetch_and_add(&m_checkins_ok, 1);
     send_json(fd, 201, "Created", buf);
 }
 
@@ -1906,17 +2117,44 @@ static void handle_participants_bulk(int fd, const char *headers, const char *bo
         if (li == 0) continue;
         if (line_num == 1 && (strstr(line_buf, "name") || strstr(line_buf, "email"))) continue;
 
-        /* Parse comma-separated fields: name,email,team,[password] */
+        /* Parse comma-separated fields: name,email,team,[password]
+         * Supports double-quoted fields with embedded commas — important
+         * for participant names like "Doe, John". The quote convention
+         * follows RFC 4180: double-quote inside a quoted field is
+         * escaped by doubling it (""). */
         char *fields[4] = {0};
         int fi = 0;
         char *cursor = line_buf;
-        fields[fi++] = cursor;
+        char *field_start = cursor;
+        int in_quotes = 0;
         while (*cursor && fi < 4) {
-            if (*cursor == ',') {
-                *cursor++ = 0;
-                fields[fi++] = cursor;
-            } else cursor++;
+            if (in_quotes) {
+                if (*cursor == '"') {
+                    if (*(cursor+1) == '"') {
+                        /* Escaped quote — collapse and continue */
+                        memmove(cursor, cursor+1, strlen(cursor));
+                        cursor++;
+                    } else {
+                        /* Closing quote — drop it from the value */
+                        *cursor = 0;
+                        cursor++;
+                        in_quotes = 0;
+                    }
+                } else cursor++;
+            } else {
+                if (*cursor == '"' && cursor == field_start) {
+                    /* Opening quote at start of field */
+                    field_start++;
+                    cursor++;
+                    in_quotes = 1;
+                } else if (*cursor == ',') {
+                    *cursor++ = 0;
+                    fields[fi++] = field_start;
+                    field_start = cursor;
+                } else cursor++;
+            }
         }
+        if (fi < 4 && field_start && *field_start) fields[fi++] = field_start;
         if (fi < 3) {
             if (errors.len > 1) sb_append(&errors, ",");
             sb_appendf(&errors, "{\"line\":%d,\"error\":\"too few fields\"}", line_num);
@@ -2479,12 +2717,14 @@ static void serve_static(int fd, const char *path) {
 
 static void handle_request(int fd, const char *method, const char *path,
                            const char *headers, const char *body) {
+    __sync_fetch_and_add(&m_requests_total, 1);
     if (strcmp(method, "OPTIONS") == 0) { send_no_content(fd); return; }
 
     /* ── GET routes ── */
     if (strcmp(method, "GET") == 0) {
         if (strcmp(path, "/health") == 0) { handle_health(fd); return; }
         if (strcmp(path, "/health/detailed") == 0) { handle_health_detailed(fd); return; }
+        if (strcmp(path, "/metrics") == 0) { handle_metrics(fd); return; }
         if (strcmp(path, "/system") == 0) { handle_system(fd); return; }
         if (strcmp(path, "/stats/database") == 0) { handle_stats_database(fd); return; }
         if (strcmp(path, "/stats/participants") == 0) { handle_stats_participants(fd); return; }

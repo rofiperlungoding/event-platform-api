@@ -35,3 +35,5 @@ CREATE INDEX IF NOT EXISTS idx_attendance_participant ON "Attendance"(participan
 CREATE INDEX IF NOT EXISTS idx_device_uuid ON "Device"(device_uuid);
 CREATE INDEX IF NOT EXISTS idx_session_code ON "Session"(code);
 CREATE INDEX IF NOT EXISTS idx_session_active ON "Session"(active, expires_at);
+
+INSERT INTO _migrations (id, name) VALUES (2, '002_auth_attendance') ON CONFLICT (id) DO NOTHING;

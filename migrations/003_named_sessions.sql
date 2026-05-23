@@ -12,3 +12,5 @@ ALTER TABLE "Session"
 -- is governed by starts_at/ends_at instead of expires_at + active flag.
 CREATE INDEX IF NOT EXISTS idx_session_title    ON "Session"(title);
 CREATE INDEX IF NOT EXISTS idx_session_schedule ON "Session"(starts_at, ends_at);
+
+INSERT INTO _migrations (id, name) VALUES (3, '003_named_sessions') ON CONFLICT (id) DO NOTHING;

@@ -46,6 +46,11 @@ set_param wal_compression        on
 set_param wal_writer_delay       '1000ms'
 set_param autovacuum_naptime     '30s'
 set_param checkpoint_completion_target  '0.9'
+# WAL recycling — bound the pg_wal directory so it cannot grow without
+# limit during a long running event with many transactions.
+set_param max_wal_size           '512MB'
+set_param min_wal_size           '80MB'
+set_param checkpoint_timeout     '15min'
 
 echo "[$(date)] postgresql.conf updated. Restart Postgres for changes:"
 echo "  pg_ctl -D \$PREFIX/var/lib/postgresql -l \$HOME/postgres.log restart"

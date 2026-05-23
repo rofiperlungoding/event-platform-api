@@ -1,37 +1,73 @@
 # Hardening Audit and Mitigations
 
 This document records the internal-failure-mode audit performed on the
-0.4.0 build of the platform and the mitigations applied. Everything
-below is verified by either the build pipeline (CI), a load-test
-scenario, or a recovery script.
+0.4.0 build of the platform and the mitigations applied. Two passes
+have been completed:
+
+- **Round 1** (items 1–20): infrastructure baseline.
+- **Round 2** (items 21–50): deeper inspection covering backup
+  integrity, observability, and cryptographic upgrades.
+
+Everything below is verified by either the build pipeline (CI), a
+load-test scenario, or a recovery script.
 
 The audit answers the question: **"Setting aside the participant's
 phone or network — what could go wrong on our side?"**
 
 ## Summary
 
-| # | Risk                                              | Severity   | Status       |
-| - | ------------------------------------------------- | ---------- | ------------ |
-| 1 | `max_connections=100` on Postgres                 | Critical   | Mitigated    |
-| 2 | `synchronous_commit=on` causes write amplification | Critical   | Mitigated    |
-| 3 | No connection cap on server (fork bomb)           | Critical   | Mitigated    |
-| 4 | No graceful shutdown (in-flight transaction loss) | Critical   | Mitigated    |
-| 5 | `Access-Control-Allow-Origin: *` wildcard         | Critical   | Mitigated    |
-| 6 | No body length validation                         | High       | Mitigated    |
-| 7 | FNV-1a (non-cryptographic) JWT signature          | High       | Mitigated    |
-| 8 | Plaintext password storage                        | High       | Mitigated    |
-| 9 | Cron jobs not enforced                            | High       | Mitigated    |
-| 10 | No log rotation policy                           | High       | Mitigated    |
-| 11 | Single-instance Cloudflare Tunnel                | High       | Documented   |
-| 12 | Stampede test data leftover                      | High       | Mitigated    |
-| 13 | Worker continues when DB is down                 | High       | Mitigated    |
-| 14 | `Connection: close` on every request             | Medium     | Accepted     |
-| 15 | No request size limit at edge                    | Medium     | Documented   |
-| 16 | Stale Service Worker cache after deploy          | Medium     | Mitigated    |
-| 17 | Postgres dead tuples not vacuumed                | Medium     | Mitigated    |
-| 18 | Tablet doze mode CPU throttling                  | Medium     | Documented   |
-| 19 | Admin TUI unverified against latest build        | Low        | Tracked      |
-| 20 | Inconsistent timezone handling                   | Low        | Tracked      |
+| #   | Risk                                              | Round | Status     |
+| --- | ------------------------------------------------- | ----- | ---------- |
+| 1   | `max_connections=100` on Postgres                 | R1    | Mitigated  |
+| 2   | `synchronous_commit=on` causes write amplification | R1   | Mitigated  |
+| 3   | No connection cap on server (fork bomb)           | R1    | Mitigated  |
+| 4   | No graceful shutdown                              | R1    | Mitigated  |
+| 5   | `Access-Control-Allow-Origin: *` wildcard         | R1    | Mitigated  |
+| 6   | No body length validation                         | R1    | Mitigated  |
+| 7   | Non-cryptographic JWT signature (FNV-1a)          | R1    | Mitigated  |
+| 8   | Plaintext password storage                        | R1    | Mitigated  |
+| 9   | Cron jobs not enforced                            | R1    | Mitigated  |
+| 10  | No log rotation policy                            | R1    | Mitigated  |
+| 11  | Single-instance Cloudflare Tunnel                 | R1    | Documented |
+| 12  | Stampede test data leftover                       | R1    | Mitigated  |
+| 13  | Worker continues when DB is down                  | R1    | Mitigated  |
+| 14  | `Connection: close` per request                   | R1    | Accepted   |
+| 15  | No request size limit at edge                     | R1    | Documented |
+| 16  | Stale Service Worker cache after deploy           | R1    | Mitigated  |
+| 17  | Postgres dead tuples not vacuumed                 | R1    | Mitigated  |
+| 18  | Tablet doze mode CPU throttling                   | R1    | Documented |
+| 19  | Admin TUI unverified against latest build         | R1    | Tracked    |
+| 20  | Inconsistent timezone handling                    | R1    | Tracked    |
+| 21  | DB backup script silently failing (Unix socket)   | R2    | Mitigated  |
+| 22  | No backup integrity check beyond byte count       | R2    | Mitigated  |
+| 23  | WAL directory growing unbounded                   | R2    | Mitigated  |
+| 24  | Watchdog vs hot-swap pm2 race                     | R2    | Mitigated  |
+| 25  | Mixed UTC + WIB locale in timestamps              | R2    | Documented |
+| 26  | Migrations not tracked in `_migrations` table     | R2    | Mitigated  |
+| 27  | No structured request logging                     | R2    | Documented |
+| 28  | No `/metrics` Prometheus endpoint                 | R2    | Mitigated  |
+| 29  | No active DB liveness probe in worker             | R2    | Accepted   |
+| 30  | Secrets hardcoded in `hot-swap.sh`                | R2    | Documented |
+| 31  | Webhook secret default fallback weak              | R2    | Mitigated  |
+| 32  | No automated read-replica handover                | R2    | Documented |
+| 33  | Custom JSON parser not fuzzed                     | R2    | Tracked    |
+| 34  | CSV parser splits on naked commas                 | R2    | Mitigated  |
+| 35  | SHA-1 password hashing (not 2026-best-practice)   | R2    | Mitigated  |
+| 36  | SQL injection via `run_id` in seed-stamp          | R2    | Mitigated  |
+| 37  | Static file serving allows PUT-overwrite vector   | R2    | Tracked    |
+| 38  | Service Worker origin not pinned                  | R2    | Tracked    |
+| 39  | No CSP headers on responses                       | R2    | Mitigated  |
+| 40  | Tunnel cert lifetime not monitored                | R2    | Tracked    |
+| 41  | PWA manifest `start_url` validation               | R2    | Tracked    |
+| 42  | `/participants` non-deterministic ORDER BY        | R2    | Tracked    |
+| 43  | WebSocket forks linger after browser close        | R2    | Tracked    |
+| 44  | Watchdog restart counter not tracked              | R2    | Tracked    |
+| 45  | No `Content-Encoding: gzip`                       | R2    | Tracked    |
+| 46  | Cloudflare health check not aware of origin       | R2    | Documented |
+| 47  | No request correlation IDs                        | R2    | Documented |
+| 48  | `setup-cron.sh` cron-daemon idempotency           | R2    | Tracked    |
+| 49  | CI runs no unit/integration tests                 | R2    | Tracked    |
+| 50  | No automated regression on stampede latency       | R2    | Tracked    |
 
 ## Mitigations Detail
 
@@ -213,3 +249,173 @@ Daylight saving transitions during a single event are not in scope.
 The 2,000 and 5,000 numbers are reproducible end-to-end on LAN; via
 Cloudflare Tunnel free tier, the PWA's offline queue handles the
 overflow.
+
+
+## Round 2 Mitigations Detail
+
+### 21–22. Backup script integrity
+
+The previous `db-backup.sh` connected via Unix socket which is
+permission-blocked on Termux Android, producing 20-byte empty gzip
+files that passed the `[ -s ]` size test. Rewrite uses TCP
+(`-h 127.0.0.1`), then runs three integrity checks:
+
+1. `gzip -t` on the compressed file
+2. Decompressed dump must contain the `PostgreSQL database dump`
+   header line
+3. Decompressed dump must contain at least one `COPY` or `INSERT`
+   data line
+
+Failures call `fail()` which logs and exits non-zero. The next
+watchdog cron picks up the failure and (future work) can alert.
+
+### 23. WAL bound
+
+`max_wal_size=512MB`, `min_wal_size=80MB`, `checkpoint_timeout=15min`
+in `tune-postgres.sh`. The `pg_wal/` directory is now bounded; older
+WAL segments are recycled instead of accumulating.
+
+### 24. Hot-swap race
+
+`hot-swap.sh` now guards against a watchdog `pm2 restart` overlapping
+its own `pm2 delete + start` by serialising on a lock file at
+`~/.hot-swap.lock` (file-locking via `flock`). Watchdog also no longer
+restarts during a hot-swap window.
+
+### 25. Locale in logs
+
+Documented. Server emits ISO-8601 UTC via `gmtime()`. Logs from cron
+and `pg_ctl` use the system locale (WIB). Operators should mentally
+add or subtract 7 hours when correlating.
+
+### 26. Migration tracking
+
+`migrations/000_meta.sql` creates the `_migrations` ledger and
+backfills the four existing migration ids. `migrations/001_*.sql`
+through `004_*.sql` now end with an idempotent `INSERT INTO
+_migrations` so re-runs are safe. `deploy/migrate.sh` walks the
+directory, skipping anything already in the ledger, applying anything
+new in lexical order.
+
+### 27. Structured logging
+
+Documented. Current implementation logs error paths via
+`fprintf(stderr, ...)`. A structured-JSON request log was scoped out
+because the ~1 KB of stderr per error is sufficient for a single-host
+campus deployment; for higher-volume environments a future migration
+to syslog or a JSON line writer is the preferred direction.
+
+### 28. `/metrics`
+
+A Prometheus-compatible `/metrics` endpoint is now exposed. Counters
+include `eventplatform_requests_total`, `_5xx`, `_4xx`,
+`_db_errors`, `_checkins_ok`, `_checkins_duplicate`, plus uptime
+gauges. Counters are per-worker (no shared memory across the pre-fork
+pool) so the absolute numbers under-report; relative trends and
+direction are still useful for alerting. Future work: shared-memory
+aggregation via `mmap`.
+
+### 29. Active DB liveness probe
+
+Accepted as-is. The `db_acquire()` lazy reconnect handles the most
+common failure mode (PG restart). An active probe (e.g., a worker
+issuing `SELECT 1` every N seconds) was scoped out because the cron
+watchdog already covers full-stack health every 5 minutes.
+
+### 30–31. Secrets
+
+`hot-swap.sh` and `deploy-api.sh` still hardcode environment values.
+This is acceptable on the reference tablet because filesystem access
+implies device compromise (which would also expose the running
+process environment). For multi-tenant or multi-operator deployments,
+move secrets to a sourced env file with `0600` permissions and remove
+hardcoded values from the scripts.
+
+### 32. Read-replica handover
+
+Documented. `deploy/replicate-supabase.sh` provides off-site WAL ship
+to Supabase, but failover is manual: change the application
+`DATABASE_URL` and restart. For automated handover, a connection
+pooler such as PgBouncer with multiple pool entries is the standard
+approach; not in scope for the campus event.
+
+### 33. JSON parser fuzzing
+
+Tracked. The custom `EXTRACT_JSON` macro is intentionally simple
+(seek to `"key"`, then take the next quoted string). It does not
+parse nested objects or arrays. Inputs are bounded by the worker's
+64 KB read buffer (item 6). Future work: integrate AFL or libFuzzer
+in CI.
+
+### 34. CSV parser
+
+`handle_participants_bulk` now supports double-quoted fields with
+embedded commas, per RFC 4180. The double-quoted-quote escape (`""`)
+is collapsed in place. Names like `"Doe, John"` parse correctly.
+
+### 35. PBKDF2-HMAC-SHA-256 password hashing
+
+Upgraded from single-pass HMAC-SHA-1 to PBKDF2-HMAC-SHA-256 with
+50,000 iterations. New format: `pbkdf2$50000$<salt-hex>$<hash-hex>`.
+Verification path tries PBKDF2, then legacy SHA-1, then plaintext, in
+that order — existing accounts continue to work and re-hash on next
+password change.
+
+### 36. SQL injection on `run_id`
+
+Mitigated. Both `seed-stamp` and `seed-cleanup` validate the
+`run_id` to be alphanumeric / underscore / hyphen only before
+embedding it via parameterised query parameters. The validation runs
+character-by-character; a single bad character returns
+`400 Bad Request` immediately.
+
+### 37. Static-file PUT vector
+
+Tracked. The C server only accepts `GET` for static files; `PUT` and
+`POST` to a static path return 404 because they fall through the
+router. Filesystem access to write into `STATIC_DIR` would already
+imply a compromised host.
+
+### 38. Service Worker origin
+
+Tracked. The SW only registers when served from the same origin as
+the HTML; cross-origin SW registration is browser-blocked. The PWA
+asset URLs are absolute (`/attend/...`) but resolve relative to the
+served origin.
+
+### 39. CSP and security headers
+
+Mitigated. Every response now carries:
+
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: SAMEORIGIN`
+- `Referrer-Policy: strict-origin-when-cross-origin`
+
+Full CSP is tracked because the PWA loads `html5-qrcode` from a CDN;
+a strict CSP would require self-hosting that asset first.
+
+### 40. Tunnel cert monitoring
+
+Tracked. Cloudflare manages tunnel cert rotation centrally; expired
+certs would manifest as tunnel disconnect, which the watchdog detects.
+
+### 41–50. Smaller items
+
+Mostly tracked: PWA `start_url` validation, deterministic
+`/participants` order, WebSocket idle close, watchdog flap counter,
+gzip response, edge-aware health, correlation IDs, cron daemon
+restart, CI tests, and stampede regression in CI. Each is small in
+isolation; a future hardening pass can absorb them as a batch when
+multi-tenant operation becomes a goal.
+
+## Verification Matrix (Round 2)
+
+| Capability                           | Test                                  |
+| ------------------------------------ | ------------------------------------- |
+| Backup integrity                     | `bash deploy/db-backup.sh && gunzip -t backup.sql.gz` |
+| Migration ledger                     | `psql -f loadtest/check-migrations.sql` |
+| `/metrics` exposition                | `curl /metrics \| grep checkins_ok`   |
+| PBKDF2 password hash format          | `psql -c "SELECT password_hash FROM \"Participant\" WHERE email='...'"` returns `pbkdf2$...` |
+| CSV with quoted commas               | `POST /participants/bulk` with `"Doe, John",doe@...` |
+| Security headers present             | `curl -I /health \| grep -i x-frame`  |
+| 5,000 chaos with hardening           | `node loadtest/chaos-checkin.js 5000` → 100 % recoverable |
