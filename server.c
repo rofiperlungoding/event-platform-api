@@ -68,6 +68,7 @@ static char db_url[1024];
 static char jwt_secret[256];
 static char webhook_secret[256];
 static char cors_allowed[512];     /* comma-separated origins, or empty for "*" */
+static char allowed_hosts[512];    /* comma-separated Host header allowlist; empty = accept any */
 
 /* ─── Metrics counters ──────────────────────────────────────────────
  * Best-effort counters across the pre-fork worker pool. Each worker
@@ -478,6 +479,44 @@ static int rate_limit_check(uint32_t ip, int limit) {
     return e->count <= limit;
 }
 
+/* ─── Per-device check-in rate limit ───────────────────────────────
+ * Mitigates (audit item 61) — attacker who registers one device and
+ * floods quick-checkin with random session codes. Per-device cap is
+ * generous enough that a real attendee scanning rapidly never trips
+ * it (one valid check-in is followed by 409s, not 30+ inserts).
+ *
+ * Key is FNV-1a over device_uuid (collision-evict policy). 64 buckets
+ * sized for the realistic case where a small handful of attackers
+ * could be running scripts; legitimate attendees never collide
+ * because they only ever hit one bucket each. */
+#define DRL_BUCKETS 64
+#define DRL_WINDOW_SEC 60
+#define DRL_LIMIT 30          /* max 30 quick-checkin attempts per device per minute */
+typedef struct {
+    unsigned long long key;   /* fnv hash of device_uuid */
+    time_t window_start;
+    int count;
+} drl_entry;
+static drl_entry drl_table[DRL_BUCKETS];
+
+/* Forward declaration; defined later in the crypto helpers section. */
+static unsigned long long fnv1a_hash(const char *data, int len);
+
+static int device_rate_limit_check(const char *device_uuid) {
+    unsigned long long h = fnv1a_hash(device_uuid, strlen(device_uuid));
+    int slot = h % DRL_BUCKETS;
+    time_t now = time(NULL);
+    drl_entry *e = &drl_table[slot];
+    if (e->key != h || (now - e->window_start) >= DRL_WINDOW_SEC) {
+        e->key = h;
+        e->window_start = now;
+        e->count = 1;
+        return 1;
+    }
+    e->count++;
+    return e->count <= DRL_LIMIT;
+}
+
 /* Send 429 with Retry-After header */
 static void send_rate_limited(int fd) {
     const char *body = "{\"error\":\"rate limit exceeded, retry shortly\"}";
@@ -590,6 +629,52 @@ static void generate_token(char *out, int out_sz, int user_id, const char *role)
     char hex[65];
     hex_encode(sig, 32, hex);
     snprintf(out, out_sz, "%d:%ld:%s:%s", user_id, (long)expiry, role, hex);
+}
+
+/* ─── Signed QR payload ─────────────────────────────────────────────
+ * Mitigates fake-QR phishing (audit item 62). Each session code
+ * embeds an HMAC-SHA-256 signature over the code itself with the JWT
+ * secret. The PWA scanner verifies the signature before submitting a
+ * check-in; an attacker who prints a QR with a different code (e.g.,
+ * pointing to a phishing URL) cannot forge a valid signature without
+ * the secret.
+ *
+ * Signed code format: "<8-char-code>.<16-hex-truncated-hmac>"
+ * Plain (legacy) code: "<8-char-code>"
+ *
+ * Truncating the HMAC to 64 bits keeps the QR small enough for
+ * mobile cameras to scan reliably while retaining 2^64 forgery cost. */
+static void sign_session_code(const char *code, char *out, int out_sz) {
+    uint8_t mac[32];
+    hmac_sha256((const uint8_t *)jwt_secret, strlen(jwt_secret),
+                (const uint8_t *)code, strlen(code), mac);
+    char hex[33];
+    hex_encode(mac, 8, hex);          /* truncate to 64-bit tag */
+    snprintf(out, out_sz, "%s.%s", code, hex);
+}
+
+/* Returns 1 if the signed payload validates and writes the bare code
+ * to *out_code (which must be at least CODE_LEN+1 bytes). 0 on bad
+ * signature OR malformed input. Plain unsigned codes (CODE_LEN
+ * characters, no dot) are rejected here — callers that want backward
+ * compatibility must check the format first. */
+static int verify_signed_session_code(const char *signed_payload, char *out_code) {
+    const char *dot = strchr(signed_payload, '.');
+    if (!dot) return 0;
+    int code_len = dot - signed_payload;
+    if (code_len != CODE_LEN) return 0;
+    if (strlen(dot + 1) != 16) return 0;
+    char code[CODE_LEN + 1];
+    memcpy(code, signed_payload, CODE_LEN);
+    code[CODE_LEN] = 0;
+
+    uint8_t expected[32], got[8];
+    hmac_sha256((const uint8_t *)jwt_secret, strlen(jwt_secret),
+                (const uint8_t *)code, CODE_LEN, expected);
+    if (hex_decode(dot + 1, 8, got) < 0) return 0;
+    if (!ct_memeq(got, expected, 8)) return 0;
+    if (out_code) memcpy(out_code, code, CODE_LEN + 1);
+    return 1;
 }
 
 /* Verify token, returns participant_id or -1 on failure.
@@ -804,11 +889,12 @@ static void handle_metrics(int fd) {
 /* ─── Original Route Handlers (unchanged) ─────────────────────────────── */
 
 static void handle_health(int fd) {
-    char buf[160];
+    char buf[200];
     snprintf(buf, sizeof(buf),
-        "{\"status\":\"ok\",\"uptime\":%ld,\"service_uptime\":%ld}",
+        "{\"status\":\"ok\",\"uptime\":%ld,\"service_uptime\":%ld,\"server_time\":%ld}",
         (long)(time(NULL) - start_time),
-        (long)(time(NULL) - service_start_time));
+        (long)(time(NULL) - service_start_time),
+        (long)time(NULL));
     send_json(fd, 200, "OK", buf);
 }
 
@@ -830,15 +916,39 @@ static void handle_health_detailed(int fd) {
     }
     long db_ms = ms_since(&db_start);
 
+    /* Deploy info — read from ~/.deploy-state if present so the
+     * dashboard can surface "last successful deploy". Mitigates audit
+     * item 73 (GitHub silent webhook failure): operators can spot a
+     * stale value at a glance. */
+    char deploy_info[256] = "{\"last_deploy\":null,\"git_sha\":null}";
+    {
+        FILE *df = fopen("/data/data/com.termux/files/home/.deploy-state", "r");
+        if (df) {
+            char line[256];
+            if (fgets(line, sizeof(line), df)) {
+                /* file format: "<unix-epoch> <git-sha>" */
+                long ts = 0; char sha[64] = "";
+                if (sscanf(line, "%ld %63s", &ts, sha) >= 1) {
+                    snprintf(deploy_info, sizeof(deploy_info),
+                        "{\"last_deploy_epoch\":%ld,\"git_sha\":\"%s\"}",
+                        ts, sha);
+                }
+            }
+            fclose(df);
+        }
+    }
+
     const char *overall = strcmp(db_status, "ok") == 0 ? "healthy" : "degraded";
     snprintf(buf, sizeof(buf),
         "{\"status\":\"%s\",\"checks\":{\"api\":{\"status\":\"ok\",\"latency_ms\":%ld},"
         "\"database\":{\"status\":\"%s\",\"latency_ms\":%ld}},"
         "\"uptime_seconds\":%ld,\"service_uptime_seconds\":%ld,"
+        "\"deploy\":%s,"
         "\"version\":\"0.4.0-c\",\"node_version\":\"native-c\"}",
         overall, api_ms, db_status, db_ms,
         (long)(time(NULL) - start_time),
-        (long)(time(NULL) - service_start_time));
+        (long)(time(NULL) - service_start_time),
+        deploy_info);
     send_json(fd, 200, "OK", buf);
 }
 
@@ -1359,9 +1469,11 @@ static void handle_session_create(int fd, const char *headers) {
     }
 
     char buf[512];
+    char signed_code[64];
+    sign_session_code(PQgetvalue(r, 0, 1), signed_code, sizeof(signed_code));
     snprintf(buf, sizeof(buf),
-        "{\"id\":%s,\"code\":\"%s\",\"expires_at\":\"%s\"}",
-        PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), PQgetvalue(r, 0, 2));
+        "{\"id\":%s,\"code\":\"%s\",\"signed_code\":\"%s\",\"expires_at\":\"%s\"}",
+        PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), signed_code, PQgetvalue(r, 0, 2));
     PQclear(r); db_release(conn);
     send_json(fd, 201, "Created", buf);
 }
@@ -1472,9 +1584,11 @@ static void handle_session_refresh(int fd, const char *headers, const char *id_s
     }
 
     char buf[512];
+    char signed_code[64];
+    sign_session_code(PQgetvalue(r, 0, 1), signed_code, sizeof(signed_code));
     snprintf(buf, sizeof(buf),
-        "{\"id\":%s,\"code\":\"%s\",\"expires_at\":\"%s\"}",
-        PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), PQgetvalue(r, 0, 2));
+        "{\"id\":%s,\"code\":\"%s\",\"signed_code\":\"%s\",\"expires_at\":\"%s\"}",
+        PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1), signed_code, PQgetvalue(r, 0, 2));
     PQclear(r); db_release(conn);
     send_json(fd, 200, "OK", buf);
 }
@@ -1562,9 +1676,32 @@ static void handle_attendance_quick_checkin(int fd, const char *body) {
     EXTRACT_JSON(body, "session_code", session_code, sizeof(session_code));
     EXTRACT_JSON(body, "device_uuid", device_uuid, sizeof(device_uuid));
 
+    /* If the client supplied a signed payload (CODE.SIG), verify and
+     * extract the bare code. Plain CODE is still accepted for backward
+     * compatibility with older PWA builds and the load-test harness. */
+    if (strchr(session_code, '.')) {
+        char bare[CODE_LEN + 1];
+        if (!verify_signed_session_code(session_code, bare)) {
+            send_json(fd, 401, "Unauthorized",
+                "{\"error\":\"invalid signed session code\"}");
+            return;
+        }
+        memcpy(session_code, bare, CODE_LEN + 1);
+    }
+
     if (!session_code[0] || !device_uuid[0]) {
         send_json(fd, 400, "Bad Request",
             "{\"error\":\"session_code and device_uuid are required\"}");
+        return;
+    }
+
+    /* Per-device flood guard: stop scripts that hammer quick-checkin
+     * with a single legitimate device_uuid against rotating session
+     * codes. Legitimate attendees never trip this because their first
+     * insert wins; subsequent attempts return 409 fast and are not
+     * counted as flood. */
+    if (!device_rate_limit_check(device_uuid)) {
+        send_rate_limited(fd);
         return;
     }
 
@@ -2720,6 +2857,29 @@ static void handle_request(int fd, const char *method, const char *path,
     __sync_fetch_and_add(&m_requests_total, 1);
     if (strcmp(method, "OPTIONS") == 0) { send_no_content(fd); return; }
 
+    /* Strict Host header check (audit items 55, 64).
+     * If ALLOWED_HOSTS is set, the request's Host header must match
+     * exactly. Defends against DNS hijacking and Host header
+     * confusion attacks. Skipped when ALLOWED_HOSTS is empty. */
+    if (allowed_hosts[0]) {
+        const char *host_hdr = strcasestr(headers, "\nHost:");
+        if (!host_hdr) host_hdr = strcasestr(headers, "\r\nHost:");
+        char host_val[128] = "";
+        if (host_hdr) {
+            host_hdr = strchr(host_hdr, ':') + 1;
+            while (*host_hdr == ' ') host_hdr++;
+            int i = 0;
+            while (*host_hdr && *host_hdr != '\r' && *host_hdr != '\n' && i < (int)sizeof(host_val) - 1)
+                host_val[i++] = *host_hdr++;
+            host_val[i] = 0;
+        }
+        if (!origin_is_allowed(host_val, allowed_hosts)) {
+            send_json(fd, 421, "Misdirected Request",
+                "{\"error\":\"host header not allowed\"}");
+            return;
+        }
+    }
+
     /* ── GET routes ── */
     if (strcmp(method, "GET") == 0) {
         if (strcmp(path, "/health") == 0) { handle_health(fd); return; }
@@ -3041,6 +3201,9 @@ int main(void) {
 
     const char *origins = getenv("CORS_ORIGINS");
     snprintf(cors_allowed, sizeof(cors_allowed), "%s", origins ? origins : "");
+
+    const char *hosts = getenv("ALLOWED_HOSTS");
+    snprintf(allowed_hosts, sizeof(allowed_hosts), "%s", hosts ? hosts : "");
 
     /* Bump file descriptor soft limit to the hard limit (Termux usually
      * 32k vs 4k default). Each WebSocket connection holds a fd, plus

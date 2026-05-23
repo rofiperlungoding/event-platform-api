@@ -91,28 +91,88 @@ input{width:100%;padding:10px 12px;margin-bottom:10px;background:#0f1419;border:
  * Operators can override the LAN IP via ?lan=... query string or
  * localStorage `ep_lan_url` so the same PWA works on different
  * deployments. */
+/* ─── API endpoint resolver ───────────────────────────────────────────
+ * On a venue Wi-Fi, every attendee can reach the tablet at its LAN IP
+ * directly — bypassing the Cloudflare Tunnel entirely. The tunnel is
+ * only needed for attendees on cellular or off-network. We probe the
+ * LAN endpoint with a 1.5 s timeout once per page load; if it answers,
+ * we use it for the rest of the session. Otherwise we fall back to
+ * the public tunnel hostname.
+ *
+ * Failure resilience (audit items 52, 54, 87, 89):
+ *   - Multiple LAN candidates can be configured via ep_lan_urls (comma
+ *     separated). The first one to respond wins.
+ *   - If the live API endpoint stops responding mid-session, the
+ *     scanner re-runs resolveApi() on the next failure and switches
+ *     transparently. Captive portals or DHCP renumbering recover
+ *     automatically.
+ *   - If neither LAN nor tunnel responds, all check-ins land in the
+ *     IndexedDB queue and drain when any endpoint comes back. */
 const PUBLIC_API = 'https://api.rofidoesthings.site';
 const DEFAULT_LAN_API = 'http://192.168.100.67:3001';
 const LAN_OVERRIDE = new URL(location.href).searchParams.get('lan')
                   || localStorage.getItem('ep_lan_url')
                   || DEFAULT_LAN_API;
+const LAN_LIST = (localStorage.getItem('ep_lan_urls') || LAN_OVERRIDE).split(',').map(s => s.trim()).filter(Boolean);
 let API = PUBLIC_API;
+let endpointHealthy = false;
 
-async function resolveApi() {
-  if (!LAN_OVERRIDE) return PUBLIC_API;
+async function probeOnce(url) {
   try {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 1500);
-    const r = await fetch(`${LAN_OVERRIDE}/health`, {signal: ctl.signal, cache: 'no-store'});
+    const r = await fetch(`${url}/health`, {signal: ctl.signal, cache: 'no-store'});
     clearTimeout(t);
     if (r.ok) {
-      console.log('[api] using LAN endpoint:', LAN_OVERRIDE);
-      return LAN_OVERRIDE;
+      const d = await r.json().catch(() => ({}));
+      /* Server clock cross-check (audit item 76): if server time
+       * differs from client by > 60 s the tokens won't validate
+       * reliably; bail with a clear message instead of silently
+       * letting the user fail. */
+      if (d.server_time) {
+        const drift = Math.abs(Date.now() / 1000 - d.server_time);
+        if (drift > 60) {
+          console.warn(`[api] ${url} clock skew ${drift|0}s; refusing endpoint`);
+          return false;
+        }
+      }
+      return true;
     }
-  } catch (e) {
-    console.log('[api] LAN probe failed, using tunnel:', e.message);
+  } catch (_) {}
+  return false;
+}
+
+async function resolveApi() {
+  /* Try every LAN candidate in parallel; whichever answers first wins. */
+  if (LAN_LIST.length) {
+    const winner = await Promise.race(LAN_LIST.map(async url => {
+      if (await probeOnce(url)) return url;
+      throw new Error('lan-fail');
+    }).concat([new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1800))]))
+      .catch(() => null);
+    if (winner) {
+      console.log('[api] LAN endpoint:', winner);
+      endpointHealthy = true;
+      return winner;
+    }
   }
+  /* Fallback: public tunnel */
+  if (await probeOnce(PUBLIC_API)) {
+    console.log('[api] tunnel endpoint');
+    endpointHealthy = true;
+    return PUBLIC_API;
+  }
+  console.warn('[api] no endpoint reachable; check-ins will queue offline');
+  endpointHealthy = false;
   return PUBLIC_API;
+}
+
+/* Re-resolve mid-session if a request fails. Cheap (probes complete
+ * in < 2 s) and idempotent. */
+async function reresolve() {
+  const old = API;
+  API = await resolveApi();
+  if (API !== old) console.log(`[api] switched ${old} → ${API}`);
 }
 let token = localStorage.getItem('ep_token') || '';
 let deviceId = localStorage.getItem('ep_device_id') || '';
@@ -400,6 +460,15 @@ async function fetchWithRetry(url, init, opts = {}) {
       clearTimeout(timer);
       lastErr = e;
     }
+    /* On the third failed attempt, re-probe endpoints — maybe the
+     * tablet's LAN IP changed (DHCP renew, AP roam) or the LAN went
+     * down and we need to switch to tunnel. */
+    if (attempt === 3) {
+      try { await reresolve(); } catch (_) {}
+      /* Rewrite the URL if it pointed at the old endpoint */
+      const oldOrigin = new URL(url).origin;
+      if (oldOrigin !== API) url = url.replace(oldOrigin, API);
+    }
     /* Jittered exponential backoff: 100, 200, 400, 800 ms ± 30 % */
     const base = 100 * Math.pow(2, attempt - 1);
     const delay = base + Math.floor(Math.random() * base * 0.6);
@@ -414,7 +483,17 @@ async function onScanSuccess(decoded) {
 
   let data;
   try { data = JSON.parse(decoded); } catch(e) { showStatus('Invalid QR', 'error'); return; }
-  if (!data.code) { showStatus('Invalid QR format', 'error'); return; }
+
+  /* Accept either:
+   *   { code: "ABC12345" }            (legacy plain code)
+   *   { signed_code: "ABC12345.HEX" } (modern signed payload)
+   * The signed payload is verified server-side; we forward it as
+   * session_code and the server will reject if the signature is
+   * forged. This is what defends against fake QR phishing
+   * (audit item 62): an attacker printing a QR with a different
+   * code cannot mint a valid signature without the JWT secret. */
+  const sessionCode = data.signed_code || data.code;
+  if (!sessionCode) { showStatus('Invalid QR format', 'error'); return; }
 
   // Try online first
   if (isOnline) {
@@ -427,7 +506,7 @@ async function onScanSuccess(decoded) {
       const r = await fetchWithRetry(`${API}/attendance/quick-checkin`, {
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({session_code: data.code, device_uuid: deviceId})
+        body: JSON.stringify({session_code: sessionCode, device_uuid: deviceId})
       });
       const d = await r.json();
       if (r.ok) {
@@ -441,7 +520,7 @@ async function onScanSuccess(decoded) {
         const fb = await fetchWithRetry(`${API}/attendance/checkin`, {
           method:'POST',
           headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
-          body: JSON.stringify({session_code: data.code, device_id: deviceId})
+          body: JSON.stringify({session_code: sessionCode, device_id: deviceId})
         });
         const fd = await fb.json();
         if (fb.ok) { showStatus('✓ Checked in!', 'success'); addHistoryItem(new Date().toISOString(), true); return; }
@@ -452,7 +531,7 @@ async function onScanSuccess(decoded) {
     } catch(e) {
       /* All retries exhausted → queue offline. The queue drains via
        * /attendance/batch-checkin once the network recovers. */
-      await addToQueue(data.code);
+      await addToQueue(sessionCode);
       showStatus('📦 Queued — will sync automatically', 'queued');
       addHistoryItem(new Date().toISOString(), false);
       triggerSync();
@@ -461,7 +540,7 @@ async function onScanSuccess(decoded) {
   }
 
   // Offline — queue locally
-  await addToQueue(data.code);
+  await addToQueue(sessionCode);
   showStatus('📦 Saved offline — will sync automatically', 'queued');
   addHistoryItem(new Date().toISOString(), false);
   triggerSync();

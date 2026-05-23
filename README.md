@@ -59,6 +59,7 @@ static assets it serves.
 | [`docs/INSTALL.md`](docs/INSTALL.md)           | Bootstrap procedure: Termux, Postgres, build, autostart, tunnel |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Design rationale, pre-fork pool, persistent connection cache |
 | [`docs/HARDENING.md`](docs/HARDENING.md)       | Internal-failure-mode audit and applied mitigations         |
+| [`docs/EXTERNAL.md`](docs/EXTERNAL.md)         | External-factor audit (hardware, network, vendor, adversary) and event-day runbook |
 | [`docs/API.md`](docs/API.md)                   | Complete REST + WebSocket reference with request/response schemas |
 | [`docs/REVERSE_PROXY.md`](docs/REVERSE_PROXY.md) | Optional Nginx ingress for hosts with a public IP          |
 | [`docs/REPLICATION.md`](docs/REPLICATION.md)   | Logical replication to Supabase for off-site backup          |

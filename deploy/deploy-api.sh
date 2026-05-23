@@ -100,6 +100,10 @@ PORT_RUNNING=$(pm2 jlist 2>/dev/null | grep -o '"PORT":"[0-9]*"' | head -1 | gre
 PORT_RUNNING=${PORT_RUNNING:-3001}
 if curl -sf "http://localhost:$PORT_RUNNING/health" > /dev/null 2>&1; then
     echo "[$(date)] ✓✓✓ DEPLOY SUCCESS ($COMMIT) — server healthy on port $PORT_RUNNING ✓✓✓" >> "$LOG"
+    # Record successful deploy timestamp + sha. /health/detailed
+    # surfaces this so dashboard can show "last deploy 3 minutes ago".
+    # Mitigates audit item 73 (silent webhook failure).
+    echo "$(date +%s) ${COMMIT:-unknown}" > "$HOME/.deploy-state"
 else
     echo "[$(date)] ⚠️ Server unhealthy after deploy — consider rollback" >> "$LOG"
 fi

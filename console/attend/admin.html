@@ -60,7 +60,7 @@ h1{font-size:20px;margin-bottom:4px}
 
 <script>
 const API = 'https://api.rofidoesthings.site';
-let token = '', sessionId = null, sessionCode = '', refreshInterval = null, countdown = 30, seenIds = new Set();
+let token = '', sessionId = null, sessionCode = '', signedCode = '', refreshInterval = null, countdown = 30, seenIds = new Set();
 
 async function login() {
   const email = document.getElementById('email').value;
@@ -88,6 +88,7 @@ async function createSession() {
   if (!r.ok) throw new Error(d.error);
   sessionId = d.id;
   sessionCode = d.code;
+  signedCode = d.signed_code || d.code;   /* fallback to plain if signing not deployed */
   document.getElementById('login-box').style.display = 'none';
   document.getElementById('qr-container').style.display = 'block';
   updateQR();
@@ -122,7 +123,11 @@ function openLiveFeed() {
 
 function updateQR() {
   document.getElementById('code-display').textContent = sessionCode;
-  const payload = JSON.stringify({code: sessionCode, api: API});
+  /* Use the signed_code (CODE.HMAC_TAG) when available so a fake QR
+   * cannot be forged without the server-side JWT secret. The PWA
+   * scanner reads either field; legacy unsigned plain code remains
+   * accepted server-side for backward compatibility. */
+  const payload = JSON.stringify({code: sessionCode, signed_code: signedCode, api: API});
   const qr = qrcode(0, 'M');
   qr.addData(payload);
   qr.make();
@@ -131,6 +136,7 @@ function updateQR() {
 
 // Preload next QR so swap is instant
 let nextCode = '';
+let nextSignedCode = '';
 async function preloadNextQR() {
   try {
     const r = await fetch(`${API}/sessions/${sessionId}/refresh`, {
@@ -139,7 +145,8 @@ async function preloadNextQR() {
     const d = await r.json();
     if (r.ok) {
       nextCode = d.code;
-      const payload = JSON.stringify({code: nextCode, api: API});
+      nextSignedCode = d.signed_code || d.code;
+      const payload = JSON.stringify({code: nextCode, signed_code: nextSignedCode, api: API});
       const qr = qrcode(0, 'M');
       qr.addData(payload);
       qr.make();
@@ -151,9 +158,11 @@ async function preloadNextQR() {
 function swapToPreloaded() {
   if (nextCode) {
     sessionCode = nextCode;
+    signedCode = nextSignedCode;
     document.getElementById('qr-display').innerHTML = document.getElementById('qr-preload').innerHTML;
     document.getElementById('code-display').textContent = sessionCode;
     nextCode = '';
+    nextSignedCode = '';
   }
 }
 
@@ -173,7 +182,7 @@ async function tick() {
           method: 'POST', headers: {'Authorization': `Bearer ${token}`}
         });
         const d = await r.json();
-        if (r.ok) { sessionCode = d.code; updateQR(); }
+        if (r.ok) { sessionCode = d.code; signedCode = d.signed_code || d.code; updateQR(); }
       } catch(e) { console.error(e); }
     }
   }
