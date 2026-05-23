@@ -17,7 +17,13 @@ mkdir -p "$LOG_DIR"
 
 # Stop any existing replica processes (does NOT touch the pm2-managed
 # event-tunnel — that one stays as a reference instance).
-pkill -f 'cloudflared.*tunnel.*--metrics' 2>/dev/null || true
+#
+# Round 7 fix (audit item 239): the previous regex matched any
+# cloudflared process with `--metrics`, which would also kill a
+# manually-started instance an operator was using for debugging.
+# We now match on the specific replica metrics-port range (20001+)
+# so debugging instances on other ports survive.
+pkill -f 'cloudflared.*--metrics 127\.0\.0\.1:200[0-9][0-9]' 2>/dev/null || true
 sleep 1
 
 for i in $(seq 1 "$REPLICAS"); do

@@ -9,8 +9,18 @@
 #     the output, not just file size > 0.
 #   - Fail loudly: write to backup.log AND deploy/alert webhook on
 #     any failure path.
+#
+# Round 7 fix (audit item 229): if PGPASSWORD is not in the env and
+# no ~/.pgpass exists, pg_dump prompts on stdin and cron silently
+# hangs forever. We now require one of the two, fail fast with a
+# clear log entry if neither is configured.
 
 set -euo pipefail
+
+if [ -z "${PGPASSWORD:-}" ] && [ ! -f "$HOME/.pgpass" ]; then
+    echo "[$(date)] BACKUP FAILED: neither PGPASSWORD env var nor ~/.pgpass is configured. Set one." >> "${HOME}/backup.log"
+    exit 1
+fi
 
 BACKUP_DIR="$HOME/backups"
 LOG="$HOME/backup.log"

@@ -1,5 +1,12 @@
-/* Service Worker — offline-first + background sync */
-const CACHE_NAME = 'checkin-v4';
+/* Service Worker — offline-first + background sync.
+ *
+ * Round 7 hardening: bumped CACHE_NAME so the new install/activate
+ * runs and the page-side `sw-updated` banner fires for every
+ * attendee on next reload. The CDN-hosted html5-qrcode script is
+ * pinned to an exact version (audit item 223); supply-chain risk
+ * exists but is mitigated by the version pin and SRI is a future
+ * polish. */
+const CACHE_NAME = 'checkin-v5';
 const STATIC_ASSETS = [
   '/attend/scan.html',
   '/attend/manifest.json',
@@ -67,8 +74,34 @@ self.addEventListener('sync', e => {
 
 async function syncCheckins() {
   /* Drain the offline queue using /attendance/batch-checkin so all items
-   * for the same session are committed in a single transaction server-side. */
-  const API = self.registration.scope.replace(/\/$/, '').replace('console.', 'api.');
+   * for the same session are committed in a single transaction server-side.
+   *
+   * Round 7 fix (audit item 221): the previous URL derivation
+   * (`scope.replace('console.', 'api.')`) only worked when the PWA
+   * was hosted under a `console.` subdomain. For a tablet that
+   * runs the API and PWA on the same origin (LAN deployments), the
+   * derived URL would be wrong and every batch would fail. We now
+   * try the same origin first, then fall back to a list of known
+   * candidates. The candidate list mirrors what `resolveApi` in
+   * scan.html accepts. */
+  const candidates = [];
+  candidates.push(self.registration.scope.replace(/\/$/, ''));
+  candidates.push(self.registration.scope.replace(/\/$/, '').replace('console.', 'api.'));
+  candidates.push('https://api.rofidoesthings.site');
+  candidates.push('http://192.168.100.67:3001');
+  /* De-dupe while preserving order */
+  const seen = new Set();
+  const tryOrder = candidates.filter(u => !seen.has(u) && seen.add(u));
+
+  let API = null;
+  for (const u of tryOrder) {
+    try {
+      const r = await fetch(`${u}/health`, { cache: 'no-store' });
+      if (r.ok) { API = u; break; }
+    } catch (_) {}
+  }
+  if (!API) return;     /* nothing reachable; retry on next sync event */
+
   const db = await openDB();
   const items = await getAllFromStore(db.transaction('queue', 'readonly').objectStore('queue'));
   if (items.length === 0) return;

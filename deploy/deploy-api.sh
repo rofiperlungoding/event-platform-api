@@ -75,6 +75,11 @@ if [ -f "$BIN_DIR/event-server" ]; then
     # Read the file content (cat) instead of cp — avoids "text file busy"
     cat "$BIN_DIR/event-server" > "$ARCHIVE_NAME" 2>/dev/null || true
     chmod +x "$ARCHIVE_NAME" 2>/dev/null || true
+    # Round 7 fix (audit item 232): fsync the archive copy before
+    # we ever mark the new binary as the live one. Without sync,
+    # a power loss in the middle of a deploy can leave the
+    # archive truncated and rollback impossible.
+    sync
     echo "[$(date)] Archived current to $ARCHIVE_NAME" >> "$LOG"
 fi
 # Rotate: keep only last 5

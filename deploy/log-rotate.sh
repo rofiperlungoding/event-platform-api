@@ -7,8 +7,17 @@
 #     and so on up to .5.gz.
 #   - Older than .5 are dropped.
 #   - All log files in $HOME matching the watch list are processed.
+#
+# Round 7 fix (audit item 238): a writer that holds the file open
+# during rotation (cron, pm2) keeps writing past the truncation
+# point, leading to a sparse file on disk. We use copytruncate
+# semantics: gzip the current file's content, then truncate the
+# original in place. The writer's fd offset is left intact, but
+# the next write fills the leading hole with zeros — acceptable
+# for log files and avoids losing the bytes that were in flight
+# during the rotate.
 
-set -e
+set -euo pipefail
 HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
 MAX_SIZE_BYTES=$((10 * 1024 * 1024))   # 10 MB
 KEEP=5

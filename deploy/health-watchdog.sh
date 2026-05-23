@@ -16,7 +16,12 @@ PORT=3001
 [ -f "$HOME/.watchdog.env" ] && . "$HOME/.watchdog.env"
 
 # ─── Quick happy path ────────────────────────────────────────────────────
-if curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
+# Round 7 fix (audit item 234): probe /health/ready rather than /health.
+# /health returns 200 as long as the process is alive — even if the
+# database is down. /health/ready returns 503 when the worker cannot
+# serve a real request, which is what we actually want a watchdog to
+# notice.
+if curl -sf "http://localhost:$PORT/health/ready" > /dev/null 2>&1; then
     exit 0
 fi
 

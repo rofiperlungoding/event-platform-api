@@ -20,7 +20,13 @@
 #   SUPABASE_PASSWORD          (from Supabase project settings)
 
 trap - CHLD
-set -e
+set -euo pipefail
+
+# Round 7 fix (audit item 236): unset PGPASSWORD on every exit
+# path, including failure. Without the trap, an early exit (e.g.,
+# pg_dump failing) would leave PGPASSWORD set in the parent shell
+# environment for any subsequent commands the operator runs.
+trap 'unset PGPASSWORD 2>/dev/null || true; rm -f "${DUMP:-}" 2>/dev/null || true' EXIT
 
 LOG="$HOME/replication.log"
 ENV_FILE="$HOME/.replication.env"

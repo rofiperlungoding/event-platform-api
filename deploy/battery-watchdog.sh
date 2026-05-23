@@ -12,8 +12,13 @@
 # Termux:API add-on was ever installed. If neither is available the
 # script emits a one-line warning per run instead of aborting; the
 # operator still gets visibility through the cron log.
+#
+# Round 7 fix (audit item 242): switch to `set -euo pipefail` so
+# a malformed termux-battery-status JSON does not silently parse
+# to empty values that compare false against the threshold and
+# look like "OK" forever.
 
-set -e
+set -euo pipefail
 LOG="$HOME/battery.log"
 THRESHOLD_PCT=20
 ALERT_HOOK="${ALERT_HOOK:-}"      # optional webhook URL

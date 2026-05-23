@@ -207,9 +207,21 @@ function safeRandomUUID() {
   const h = [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
   return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
 }
+/* Defensive setItem helper — localStorage on iOS Safari Private mode
+ * throws QuotaExceededError on every write, and Android Webview can
+ * fail under low memory. Round 7 fix (audit item 211): the previous
+ * raw localStorage.setItem calls would throw and propagate, breaking
+ * registration entirely on private-mode browsers. */
+function safeSetItem(key, value) {
+  try { localStorage.setItem(key, value); return true; }
+  catch (e) {
+    console.warn('[storage] setItem failed:', key, e.name);
+    return false;
+  }
+}
 if (!deviceId) {
   deviceId = 'dev-' + safeRandomUUID();
-  localStorage.setItem('ep_device_id', deviceId);
+  safeSetItem('ep_device_id', deviceId);
 }
 
 // ─── IndexedDB for offline queue ────────────────────────────────────────
@@ -331,6 +343,29 @@ let drainInterval = setInterval(async () => {
   if (n > 0 && navigator.onLine) processQueue();
 }, 15000);
 
+/* Round 7 fix (audit item 214): clear the timer when the page is
+ * hidden or unloaded. Webkit on iOS and recent Chrome put hidden
+ * tabs to sleep, but Android Webview will keep firing the interval
+ * for hours, draining battery for no reason. We restart the
+ * interval on visibility change. */
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    clearInterval(drainInterval);
+    drainInterval = null;
+  } else if (!drainInterval) {
+    drainInterval = setInterval(async () => {
+      const n = await getQueueCount();
+      if (n > 0 && navigator.onLine) processQueue();
+    }, 15000);
+    /* Drain immediately on resume so a queue that grew while hidden
+     * gets caught up the moment the user looks at the screen. */
+    if (navigator.onLine) processQueue();
+  }
+});
+window.addEventListener('beforeunload', () => {
+  if (drainInterval) clearInterval(drainInterval);
+});
+
 // ─── Online/Offline detection ───────────────────────────────────────────
 window.addEventListener('online', () => {
   isOnline = true;
@@ -392,6 +427,17 @@ if ('serviceWorker' in navigator) {
         showScanPhase();
         return;
       }
+      /* Round 7 fix (audit item 217): distinguish "server says token
+       * is bad" from "we couldn't reach the server". A 401/403 means
+       * we should clear the stored token and force re-login; a
+       * network failure (catch branch below) should keep the token
+       * and show scan phase optimistically. */
+      if (r.status === 401 || r.status === 403) {
+        token = '';
+        try { localStorage.removeItem('ep_token'); } catch (_) {}
+        showStatus('Sesi login habis. Silakan login ulang.', 'info');
+        return;
+      }
     } catch(e) {
       // Offline but have token — show scan anyway
       userName = localStorage.getItem('ep_name') || 'Offline User';
@@ -399,7 +445,8 @@ if ('serviceWorker' in navigator) {
       showScanPhase();
       return;
     }
-    token = ''; localStorage.removeItem('ep_token');
+    token = '';
+    try { localStorage.removeItem('ep_token'); } catch (_) {}
   }
 })();
 
@@ -463,9 +510,9 @@ async function authRegister() {
     const d = await r.json();
     if (!r.ok) throw new Error(localiseError(d.error));
     token = d.token;
-    localStorage.setItem('ep_token', token);
-    localStorage.setItem('ep_name', d.participant.name);
-    localStorage.setItem('ep_team', d.participant.team);
+    safeSetItem('ep_token', token);
+    safeSetItem('ep_name', d.participant.name);
+    safeSetItem('ep_team', d.participant.team);
     userName = d.participant.name;
     userTeam = d.participant.team;
     await fetch(`${API}/device/link`, {
@@ -489,9 +536,9 @@ async function authLogin() {
     const d = await r.json();
     if (!r.ok) throw new Error(localiseError(d.error));
     token = d.token;
-    localStorage.setItem('ep_token', token);
-    localStorage.setItem('ep_name', d.participant.name);
-    localStorage.setItem('ep_team', d.participant.team);
+    safeSetItem('ep_token', token);
+    safeSetItem('ep_name', d.participant.name);
+    safeSetItem('ep_team', d.participant.team);
     userName = d.participant.name;
     userTeam = d.participant.team;
     await fetch(`${API}/device/link`, {
@@ -513,7 +560,14 @@ function showManualEntry() {
 async function submitManualCode() {
   const raw = document.getElementById('manual-code').value.trim();
   if (!raw) { showStatus('Masukkan kode dulu', 'error'); return; }
-  /* Manual entry accepts either plain code or signed_code */
+  /* Round 7 fix (audit item 215): validate manual entry with the
+   * same regex the scanner uses (`8 alnum` optionally followed by
+   * `.16-hex`). Anything else gets rejected client-side rather
+   * than a confusing 400 from the server. */
+  if (!/^[A-Za-z0-9]{8}(\.[a-f0-9]{16})?$/.test(raw)) {
+    showStatus('Kode harus 8 huruf/angka. Cek lagi ya.', 'error');
+    return;
+  }
   await processCheckin(raw);
   document.getElementById('manual-code').value = '';
 }
@@ -576,7 +630,14 @@ async function fetchWithRetry(url, init, opts = {}) {
 }
 
 async function onScanSuccess(decoded) {
-  if (scanner) { await scanner.stop(); scanner = null; }
+  /* Round 7 fix (audit item 220): scanner.stop() can throw if the
+   * underlying camera stream was already torn down (e.g., user
+   * switched tabs mid-scan). Wrap in try so the rest of the
+   * pipeline still runs. */
+  if (scanner) {
+    try { await scanner.stop(); } catch (_) {}
+    scanner = null;
+  }
   document.getElementById('btn-start-scan').classList.remove('hidden');
 
   let data;
@@ -692,6 +753,12 @@ function addHistoryItem(ts, synced) {
   const hist = document.getElementById('history');
   if (hist.children.length > 1) hist.insertBefore(el, hist.children[1]);
   else hist.appendChild(el);
+  /* Round 7 fix (audit item 212): cap the rendered history list at
+   * 50 entries. Without this, a user who keeps the PWA open across
+   * a multi-day event would accumulate hundreds of DOM nodes; on
+   * a low-RAM Android Webview that turns into noticeable jank
+   * within a few hundred. The first child is the <h3> header. */
+  while (hist.children.length > 51) hist.removeChild(hist.lastElementChild);
 }
 </script>
 </body>

@@ -11,8 +11,13 @@
 # For TLS expiry we use the openssl s_client trick if present; if
 # absent we curl the API and parse the CF-issued cert via Cloudflare's
 # `report-to` header which always carries a fresh signature.
+#
+# Round 7 fix (audit item 240): `set -euo pipefail` so a broken
+# openssl pipeline does not silently report an empty expiry as
+# "OK". We also tolerate openssl returning empty (e.g., transient
+# network) by treating it as an unknown rather than a stale alert.
 
-set -e
+set -euo pipefail
 LOG="$HOME/cert.log"
 DOMAIN="${DOMAIN:-api.rofidoesthings.site}"
 WARN_DAYS=30

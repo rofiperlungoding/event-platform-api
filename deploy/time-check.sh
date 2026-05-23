@@ -6,8 +6,13 @@
 # in Termux). Warns if drift exceeds 5 seconds; the JWT verification
 # tolerates drift up to TOKEN_EXPIRY (24 h) so the threshold is well
 # below anything that breaks attendance, but we want early warning.
+#
+# Round 7 fix (audit item 241): `set -euo pipefail` so a broken
+# curl pipe (e.g., DNS hiccup) does not look like an empty
+# "Date:" header and silently degrade the quorum below the
+# minimum sample threshold.
 
-set -e
+set -euo pipefail
 LOG="$HOME/time.log"
 THRESHOLD_SEC=5
 

@@ -6,6 +6,10 @@
 # filename (`NNN_`) serves as the id. The `000_meta.sql` migration
 # bootstraps the tracking table itself and must succeed before any
 # other migration runs.
+#
+# Round 7 fix (audit item 230): `set -euo pipefail` so a typo in
+# DB_HOST or a half-open psql pipeline aborts immediately rather
+# than rolling forward into an inconsistent migration list.
 
 set -euo pipefail
 

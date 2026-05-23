@@ -11,8 +11,21 @@ LOG="$HOME/rollback.log"
 
 echo "[$(date)] === ROLLBACK START ===" >> "$LOG"
 
-# Find latest archived binary (excluding current)
-LATEST=$(ls -t "$ARCHIVE"/event-server-* 2>/dev/null | head -1)
+# Find latest archived binary (excluding current).
+# Round 7 fix (audit item 235): the previous version blindly took
+# the most recent archive. If a deploy had archived a broken
+# binary moments before health-watchdog escalated to rollback, we
+# would roll forward into the same broken binary. Now we scan the
+# archive list newest-first and skip any entry tagged FAILED-* —
+# those are deposits made by previous rollbacks and known bad.
+LATEST=""
+for cand in $(ls -t "$ARCHIVE"/event-server-* 2>/dev/null); do
+    case "$(basename "$cand")" in
+        event-server-FAILED-*) continue ;;
+    esac
+    LATEST="$cand"
+    break
+done
 
 if [ -z "$LATEST" ]; then
     echo "[$(date)] ❌ No archived binary to rollback to" >> "$LOG"

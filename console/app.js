@@ -58,10 +58,22 @@ const applyStatus = (cardId, status) => {
   if (status) el.classList.add(`status-${status}`);
 };
 
-async function fetchJson(path) {
-  const res = await fetch(`${API}${path}`, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return res.json();
+async function fetchJson(path, opts = {}) {
+  /* Round 7 fix (audit item 228): every console fetch now has a
+   * 6-second timeout. Without it, a stuck endpoint blocks the
+   * `Promise.allSettled` for the full duration of whatever the
+   * browser's default timeout is (60 s on Chromium) and the
+   * dashboard appears frozen. AbortController fires the rejection
+   * cleanly so the per-section error-state renderer takes over. */
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), opts.timeout || 6000);
+  try {
+    const res = await fetch(`${API}${path}`, { cache: 'no-store', signal: ctl.signal });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 // ─── Tabs ───────────────────────────────────────────────────────────────────

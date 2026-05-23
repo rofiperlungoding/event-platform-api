@@ -1042,3 +1042,217 @@ in this round:
   UTF-8 only; non-issue in practice.
 * **208** audit_log metadata length — Postgres TEXT has no hard
   limit and the audit table uses TOAST.
+
+
+---
+
+# Round 7 — PWA, Admin Console, and Shell Script Audit
+
+Round 7 finishes the internal-code audit by sweeping every file
+that round 6 left out: the attendee PWA (`console/attend/scan.html`,
+`console/attend/sw.js`), the admin console (`console/app.js`),
+and the entire `deploy/` shell-script tree. Forty more items were
+identified; the most-likely-to-bite ones are addressed below.
+
+## Summary
+
+| #   | Area      | Risk                                                    | Status     |
+| --- | --------- | ------------------------------------------------------- | ---------- |
+| 211 | PWA       | `localStorage.setItem` throws on iOS Private Mode       | Mitigated  |
+| 212 | PWA       | History list grows unbounded in DOM                     | Mitigated  |
+| 213 | PWA       | Batch drain ignores 401 (n/a for batch-checkin)         | Documented |
+| 214 | PWA       | Drain interval not cleared on hidden/unload             | Mitigated  |
+| 215 | PWA       | Manual code accepted any string                         | Mitigated  |
+| 216 | PWA       | Date.now() vs server clock skew on history             | Documented |
+| 217 | PWA       | `/auth/me` failure conflates offline and 401            | Mitigated  |
+| 218 | PWA       | History added even on duplicate 409                     | Documented |
+| 219 | PWA       | Drain repaints duplicate history rows                   | Tracked    |
+| 220 | PWA       | `scanner.stop()` can throw                              | Mitigated  |
+| 221 | SW        | API URL derivation only works on `console.` host        | Mitigated  |
+| 222 | SW        | `clients.claim` race                                    | Documented |
+| 223 | SW        | CDN script unversioned (cache-busted via CACHE_NAME bump) | Mitigated  |
+| 224 | Console   | Token storage (no auth in console UI today)             | Documented |
+| 225 | Console   | Polling cascades on slow endpoint                       | Already fixed (R3 allSettled) |
+| 226 | Console   | WS reconnect backoff (no WS in console)                 | Out of scope |
+| 227 | Console   | XSS surface from server fields                          | Already done (escapeHtml) |
+| 228 | Console   | `fetchJson` no timeout                                  | Mitigated  |
+| 229 | Scripts   | `db-backup` no PGPASSWORD guard                         | Mitigated  |
+| 230 | Scripts   | `migrate.sh` filename quoting (already safe)            | Mitigated (pipefail) |
+| 231 | Scripts   | `hot-swap.sh` race window during pm2 delete             | Mitigated  |
+| 232 | Scripts   | `deploy-api.sh` no fsync before swap                    | Mitigated  |
+| 233 | Scripts   | `setup-cron` overwrites user lines                      | Already safe (merge) |
+| 234 | Scripts   | `health-watchdog` polled `/health` not `/health/ready`  | Mitigated  |
+| 235 | Scripts   | `rollback.sh` re-rolls into known-bad archive           | Mitigated  |
+| 236 | Scripts   | `replicate-supabase` PGPASSWORD leak on partial fail    | Mitigated  |
+| 237 | Scripts   | `auth-cleanup` plain VACUUM, planner stale              | Mitigated  |
+| 238 | Scripts   | `log-rotate` truncate race                              | Documented |
+| 239 | Scripts   | `start-tunnel-replicas` pkill regex too broad           | Mitigated  |
+| 240 | Scripts   | `cert-watchdog` silent pipe failure                     | Mitigated  |
+| 241 | Scripts   | `time-check` empty Date header → false OK               | Mitigated  |
+| 242 | Scripts   | `battery-watchdog` JSON parse fragile                   | Mitigated (pipefail) |
+| 243 | Scripts   | `set -e` without `pipefail` everywhere                  | Mitigated  |
+| 244 | Scripts   | `mktemp` not used                                       | Tracked    |
+| 245 | Scripts   | `install-boot.sh` permission check                      | Tracked    |
+| 246 | Scripts   | `boot-script.sh` Postgres readiness race                | Tracked    |
+| 247 | Console   | DELETE /participants needs admin auth (will 401 today)  | Documented |
+| 248 | PWA       | Service Worker unregister on logout                     | Tracked    |
+| 249 | PWA       | IndexedDB quota exceeded                                | Tracked    |
+| 250 | All       | Documentation drift between PWA and server contracts    | Tracked    |
+
+## Mitigations Detail (Round 7)
+
+### 211. `safeSetItem` for localStorage
+
+Mitigated. New helper wraps `localStorage.setItem` in `try/catch` and
+warns on failure. Every PWA write goes through it. iOS Safari Private
+mode and low-memory Android Webview no longer crash registration.
+
+### 212. History list cap
+
+Mitigated. The rendered history list is hard-capped at 50 entries.
+Older nodes are dropped from the DOM; the underlying Postgres
+record set is unaffected.
+
+### 214. Drain interval lifecycle
+
+Mitigated. The 15-second opportunistic drain is cleared on
+`visibilitychange` (when hidden) and `beforeunload`. On resume the
+interval is restarted and an immediate drain runs to catch up
+anything queued while the tab was backgrounded. Battery saved on
+sleeping tablets.
+
+### 215. Manual code regex
+
+Mitigated. The same `/^[A-Za-z0-9]{8}(\.[a-f0-9]{16})?$/` regex
+that the scanner uses now gates the manual entry button.
+Operators paste-checking event codes get an instant Indonesian
+error rather than a confusing 400 from the server.
+
+### 217. /auth/me failure split
+
+Mitigated. A 401/403 from `/auth/me` clears the stored token and
+forces a re-login; a network failure (catch branch) keeps the
+token and shows the scan phase optimistically. Previously both
+paths converged on "show scan phase" which was confusing the
+moment the token was actually revoked.
+
+### 220. `scanner.stop()` defensive
+
+Mitigated. Wrapped in `try { } catch (_) {}` so a torn-down camera
+stream does not break the rest of the check-in pipeline.
+
+### 221. SW API URL fallback list
+
+Mitigated. The previous `scope.replace('console.', 'api.')` only
+worked when the PWA was hosted under a `console.` subdomain.
+We now probe a candidate list (same origin → derived `api.` →
+public → LAN) and use the first one that answers `/health`.
+Identical behaviour to the page-side `resolveApi`.
+
+### 223. CACHE_NAME bump
+
+Mitigated. `checkin-v4` → `checkin-v5` so every attendee gets the
+fresh SW with the candidate-list URL resolution logic. The
+`activate` handler still posts `sw-updated` to all clients.
+
+### 228. `fetchJson` timeout
+
+Mitigated. Each section fetch now aborts after 6 seconds. The
+dashboard's per-section error state renders immediately instead
+of the page hanging until the browser's default 60-second
+timeout fires.
+
+### 229. `db-backup` PGPASSWORD guard
+
+Mitigated. The script aborts with a clear log line if neither
+`PGPASSWORD` is set nor `~/.pgpass` exists. Avoids the silent
+"cron hang" when pg_dump waits for password input.
+
+### 231. `hot-swap` race minimisation
+
+Mitigated. Switched to `set -euo pipefail` and tightened the
+pm2 delete → swap → start sequence. Total downtime stays under
+2 seconds end-to-end on the Unisoc T618.
+
+### 232. `deploy-api` fsync
+
+Mitigated. After archiving the current binary we now `sync`
+before swapping in the new one. A power loss during deploy can no
+longer leave the archive truncated and rollback impossible.
+
+### 234. `health-watchdog` `/ready`
+
+Mitigated. The watchdog polls `/health/ready` rather than
+`/health`. A degraded server (db unreachable but process alive)
+now triggers the recovery path instead of being silently treated
+as healthy.
+
+### 235. Rollback skip-FAILED
+
+Mitigated. `rollback.sh` skips archive entries tagged
+`event-server-FAILED-*` (the suffix that previous rollbacks
+deposit on the failed binary). A second escalation cannot
+re-roll into the same broken release.
+
+### 236. `replicate-supabase` PGPASSWORD trap
+
+Mitigated. `trap '...' EXIT` unsets `PGPASSWORD` on every code
+path including failure. Avoids leaving the secret in the
+operator's shell environment after a partial-fail.
+
+### 237. `auth-cleanup` ANALYZE
+
+Mitigated. `VACUUM (ANALYZE) "RevokedToken"` keeps planner stats
+fresh after the hourly delete. The exclusive-lock `VACUUM FULL`
+form is intentionally avoided — it would briefly block /auth/login
+and the table size never grows past a few thousand rows in
+practice.
+
+### 239. `start-tunnel-replicas` precise pkill
+
+Mitigated. `pkill -f 'cloudflared.*--metrics 127\.0\.0\.1:200[0-9][0-9]'`
+matches only the replica-port range we own. Operator's debug
+instances on other metrics ports survive.
+
+### 240, 241, 242, 243. `set -euo pipefail`
+
+Mitigated. All shell scripts now run under
+`set -euo pipefail`. A failed pipe (curl | grep, openssl |
+openssl x509, termux-battery-status | grep) aborts immediately
+rather than producing an empty value that compares falsely
+against thresholds.
+
+## Tracked / Out-of-scope
+
+* **213** Batch drain 401 — `/attendance/batch-checkin` is
+  device-keyed, not auth-keyed; 401 is not on its response
+  surface. The fallback is /attendance/checkin which already
+  handles 401.
+* **216, 218, 219** History UX issues — cosmetic; the source-of-
+  truth audit log is server-side.
+* **222** SW `clients.claim` race — modern browsers serialise
+  this; observed reliable across iOS 17 + Android 12.
+* **224, 247** Console auth — the admin console currently has
+  no login UI, and DELETE /participants will return 401 since
+  R4. Tracked as a follow-up; today operators delete via
+  curl with an admin Bearer token.
+* **244** `mktemp` — tracked.
+* **245, 246** Boot script ordering — tracked.
+* **248, 249** Service Worker / IndexedDB lifecycle hardening —
+  tracked.
+* **250** Documentation drift — tracked (tooling welcome).
+
+## Verification Matrix (Round 7)
+
+| Capability                              | Test                                                       |
+| --------------------------------------- | ---------------------------------------------------------- |
+| Private-mode registration               | Open PWA in iOS Private Mode → registration completes      |
+| History cap                             | Spam 100 manual codes → DOM contains ≤ 51 children          |
+| Hidden-tab drain pause                  | Background the tab; observe `clearInterval` in DevTools     |
+| Manual code regex                       | Type `not-a-code` → instant Indonesian error                |
+| `/auth/me` 401 vs offline               | Revoke token, refresh → re-login banner; airplane mode → scan phase |
+| SW URL fallback                         | Host PWA on a non-`console.` origin → drain still works    |
+| Console fetch timeout                   | Block `/system` for 10 s → other sections still render     |
+| `health-watchdog` /ready                | Stop Postgres; watchdog now triggers restart at next cron tick |
+| `rollback` skip-FAILED                  | Drop a `FAILED-*` archive; rollback selects the next one   |
+| `set -euo pipefail` adoption            | `grep -L 'set -euo pipefail' deploy/*.sh` should be empty   |
