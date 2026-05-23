@@ -30,6 +30,15 @@ WATCH_LIST=(
     "$HOME_DIR/backup.log"
     "$HOME_DIR/cron.log"
     "$HOME_DIR/postgres.log"
+    "$HOME_DIR/boot.log"
+    "$HOME_DIR/replication.log"
+    "$HOME_DIR/auth-cleanup.log"
+    "$HOME_DIR/battery.log"
+    "$HOME_DIR/cert.log"
+    "$HOME_DIR/time.log"
+    "$HOME_DIR/email.log"
+    "$HOME_DIR/install-boot.log"
+    "$HOME_DIR/rollback.log"
 )
 
 rotate_one() {

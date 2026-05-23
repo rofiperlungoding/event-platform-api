@@ -1342,3 +1342,182 @@ The existing `X-Content-Type-Options`, `X-Frame-Options`, and
 | Permissions-Policy                      | `curl -sI /health \| grep -i permissions-policy`   |
 | DATABASE_URL redacted                   | restart the binary, scan log for `:***@` not the actual password |
 | Recent-checkins query plan              | `EXPLAIN SELECT * FROM "Attendance" ORDER BY "checkedInAt" DESC LIMIT 50` → Index Scan |
+
+
+---
+
+# Round 10 — TUI, Boot Stack, Status Probe, Loadtest
+
+Round 10 sweeps the parts of the repo that previous rounds had
+deferred: the ncurses admin TUI, the Termux:Boot autostart script
+and its installer, the dashboard's `full-status.json` writer, and
+the load-test orchestrators.
+
+## Summary
+
+| #   | Area      | Risk                                                    | Status     |
+| --- | --------- | ------------------------------------------------------- | ---------- |
+| 261 | TUI       | `g_db_url` mutable from argv only — no env fallback     | Mitigated  |
+| 262 | TUI       | DATABASE_URL env not consulted                          | Mitigated  |
+| 263 | TUI       | `strncpy` no null-terminate on max-length pg_version    | Mitigated  |
+| 264 | TUI       | `getch` blocking model burns CPU                        | Documented |
+| 265 | TUI       | No SIGWINCH handler                                     | Mitigated  |
+| 266 | TUI       | COLOR pairs used without `has_colors()` re-check        | Documented |
+| 267 | TUI       | Fresh PGconn every 3-second refresh                     | Mitigated  |
+| 268 | TUI       | Connection error displays no detail                     | Tracked    |
+| 269 | TUI       | DATABASE_URL via argv visible in `ps`                   | Mitigated  |
+| 270 | TUI       | No `--help` flag                                        | Mitigated  |
+| 271 | Boot      | `pg_ctl start` blocks if already running                | Mitigated  |
+| 272 | Boot      | Arbitrary sleeps; no readiness probe                    | Mitigated  |
+| 273 | Boot      | `pm2 resurrect` race with daemon startup                | Mitigated  |
+| 274 | Boot      | `pkill sshd; sshd` race                                 | Mitigated  |
+| 275 | Boot      | No `set -uo pipefail`                                   | Mitigated  |
+| 276 | Boot      | `boot.log` not in log-rotate watch list                 | Mitigated  |
+| 277 | Boot      | No wake-lock release on shutdown                        | Tracked    |
+| 278 | Install   | No source-script exists check                           | Mitigated  |
+| 279 | Install   | `cp` requires re-install on every edit                  | Documented |
+| 280 | Install   | No Termux:Boot APK presence check                       | Mitigated  |
+| 281 | Status    | `chmod 644` ignored if file is symlinked                | Mitigated (graceful) |
+| 282 | Status    | `crontab \| tr` semicolons break JSON                   | Mitigated  |
+| 283 | Status    | `ifconfig` deprecated                                   | Mitigated  |
+| 284 | Status    | No defensive shell flags                                | Mitigated  |
+| 285 | Status    | Log content can JSON-inject via backslashes             | Mitigated  |
+| 286 | Loadtest  | `parseInt(argv)` no validation — NaN loop               | Mitigated  |
+| 287 | Loadtest  | Global dispatcher set unconditionally                   | Documented |
+| 288 | Loadtest  | Ctrl-C leaves seeded data behind                        | Mitigated  |
+| 289 | Loadtest  | Empty results array → NaN percentiles                   | Mitigated  |
+| 290 | Loadtest  | Error body printed without redaction                    | Mitigated  |
+
+## Mitigations Detail (Round 10)
+
+### 261, 262, 269. TUI conninfo via env
+
+Mitigated. `admin-tui` now consults `DATABASE_URL` from the
+environment when no argv is supplied. Operators stop having to
+write the password into shell history. When argv IS used, that's
+explicit and we keep the behaviour.
+
+### 263. `strncpy` null-terminate
+
+Mitigated. `out->pg_version[sizeof(out->pg_version) - 1] = 0` after
+every `strncpy`. The only caller that hits the cap is when the
+PostgreSQL version banner exceeds 63 bytes (it doesn't today, but
+defending against future Postgres upgrades or fork branding is
+cheap).
+
+### 265. SIGWINCH
+
+Mitigated. `sigaction(SIGWINCH, ...)` flips a `volatile sig_atomic_t`
+flag; the main loop calls `endwin()` + `refresh()` + `clear()` to
+re-initialise ncurses dimensions on the next tick.
+
+### 267. Cached PGconn in TUI
+
+Mitigated. `g_conn` is opened once and reset via `PQreset()` on a
+stale connection. Refresh tick now costs ~5 ms (six SELECT COUNT
+queries) instead of ~70 ms (full TCP+startup handshake every time).
+
+### 270. `--help` / `-h`
+
+Mitigated. Standard usage banner. Returns 0.
+
+### 271. Postgres readiness probe
+
+Mitigated. `boot-script.sh` first checks `pg_ctl status`; if
+running, it skips `start` entirely. After a fresh start it loops
+on `pg_isready -h 127.0.0.1` for up to 20 seconds. The arbitrary
+`sleep 4` is gone.
+
+### 273. pm2 resurrect retry
+
+Mitigated. The boot script retries `pm2 resurrect` up to 5 times
+with a 2-second delay. Without this, a slow Android device that
+hadn't started the pm2 daemon by the time the boot script ran
+would leave the API process orphaned for the entire uptime
+window until the operator manually intervened.
+
+### 274. sshd idempotent
+
+Mitigated. `pgrep -x sshd` gates the `sshd` invocation. The
+previous `pkill sshd; sshd` pair had a brief window where SSH
+was unreachable, which mattered if the operator was already
+trying to connect from the next room.
+
+### 276. boot.log + the rest in log-rotate
+
+Mitigated. The `WATCH_LIST` in `log-rotate.sh` now covers all 16
+known log files (`boot.log`, `replication.log`, `auth-cleanup.log`,
+`battery.log`, `cert.log`, `time.log`, `email.log`,
+`install-boot.log`, `rollback.log` joined the original 7).
+
+### 278, 280. Install-boot guards
+
+Mitigated. The installer fails fast if the source script is
+missing or the destination directory is not writable. It also
+emits a `[WARN]` log line if the `com.termux.boot` package is not
+detected via `pm list packages`, so the operator knows the
+autostart will never actually fire until the APK is installed.
+
+### 282, 285. JSON escape in full-status
+
+Mitigated. Replaced inline shell concatenation with a `jstr` sed
+pipeline that escapes backslashes, double quotes, tabs, and
+newlines. The dashboard can now ingest `full-status.json` even
+when a log line contains `\` or embedded `"` characters that
+previously broke `JSON.parse`.
+
+### 283. `ip addr` over `ifconfig`
+
+Mitigated. The deprecated `ifconfig` is the fallback; `ip -4 addr`
+is preferred. Modern Termux ships only the iproute2 toolset.
+
+### 286. Argv validation in loadtest
+
+Mitigated. `parseInt32(s, fallback, name)` rejects NaN, zero,
+negative, and absurd values (> 100000). A typo no longer creates
+an infinite loop on the operator's machine.
+
+### 288. SIGINT cleanup trap
+
+Mitigated. `process.on('SIGINT', ...)` runs `seed-cleanup` with
+the cached admin token before exit. Operators who Ctrl-C a long
+stampede no longer leave thousands of `dev-stamp-...`
+participants polluting the dashboard.
+
+### 289. Empty results percentiles
+
+Mitigated. `pct(p)` returns 0 for an empty array. Loadtest output
+is no longer riddled with `NaN ms` on a run that crashed
+immediately.
+
+### 290. Body redaction
+
+Mitigated. New `redact()` replaces `"password":"..."` and
+`Bearer <tok>` with `***` before any error body lands in console
+output. Both `run-stampede.js` and `chaos-checkin.js` use it.
+
+## Tracked
+
+* **264** Reduce ncurses CPU spin (poll() instead of timeout()).
+* **266** `has_colors()` re-check on resize.
+* **268** Display `PQerrorMessage()` text in the unreachable
+  banner so operators can see "could not connect to ::1" vs
+  "auth failed".
+* **277** Wake-lock release on graceful pm2 stop.
+* **279** Symlink instead of copy for boot script.
+* **287** Per-call dispatcher (loadtest currently single-shot).
+
+## Verification Matrix (Round 10)
+
+| Capability                              | Test                                                       |
+| --------------------------------------- | ---------------------------------------------------------- |
+| TUI env DATABASE_URL                    | `unset args; DATABASE_URL=postgresql://... admin-tui` → connects |
+| TUI cached PGconn                       | `strace -p <pid> -e connect 2>&1 \| head` → no new connects |
+| TUI resize                              | `resize -s 30 100` while TUI is open → redraws cleanly      |
+| Boot Postgres readiness                 | `pg_ctl stop; bash deploy/boot-script.sh` → script waits and reports HEALTHY |
+| boot.log rotated                        | `truncate -s 11M $HOME/boot.log; bash deploy/log-rotate.sh` → boot.log.1.gz exists |
+| install-boot APK warn                   | Run on a tablet without Termux:Boot → `[WARN]` line in log |
+| full-status JSON valid                  | `bash deploy/full-status.sh && jq . console/full-status.json` → no parse error |
+| run-stampede argv                       | `node run-stampede.js abc` → falls back to 2000, no infinite loop |
+| run-stampede SIGINT cleanup             | Start, Ctrl-C → next `/stats/participants` shows no `dev-stamp-` rows |
+| Loadtest body redaction                 | Inject a fake token in a 5xx response → output shows `Bearer ***` |

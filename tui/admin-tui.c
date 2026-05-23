@@ -9,19 +9,30 @@
  *   cc -O2 -Wall -o admin-tui admin-tui.c -lpq -lncurses
  *
  * RUN:
- *   admin-tui [database-url]
+ *   admin-tui [database-url]              # explicit URL via argv
+ *   DATABASE_URL=... admin-tui            # via environment
  *
  * KEY BINDINGS:
  *   q   quit
  *   r   refresh now
  *   p   pause/resume auto-refresh
  *   ?   show help overlay
+ *
+ * ROUND 10 HARDENING:
+ *   - DATABASE_URL env var is consulted when argv is empty so the
+ *     conninfo (and its password) does not appear in `ps -ef` output
+ *     (audit item 269).
+ *   - The libpq connection is cached across refresh ticks rather than
+ *     opened fresh every 3 seconds (item 267).
+ *   - SIGWINCH redraws on terminal resize (item 265).
+ *   - --help flag prints usage (item 270).
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <time.h>
 #include <ncurses.h>
 #include <libpq-fe.h>
@@ -41,15 +52,29 @@ typedef struct {
 } platform_stats;
 
 static const char *g_db_url = "postgresql://rofi:devsecret@localhost:5432/eventplatform";
+static PGconn *g_conn = NULL;            /* round 10: cached connection */
+static volatile sig_atomic_t g_resize = 0;
+
+static void on_sigwinch(int sig) {
+    (void)sig;
+    g_resize = 1;
+}
 
 static int fetch_stats(platform_stats *out) {
-    PGconn *conn = PQconnectdb(g_db_url);
-    if (PQstatus(conn) != CONNECTION_OK) {
+    /* Round 10 fix (audit item 267): reuse the cached PGconn rather
+     * than open a fresh one every refresh tick. PQreset is a cheap
+     * no-op when the connection is healthy. */
+    if (!g_conn) {
+        g_conn = PQconnectdb(g_db_url);
+    } else if (PQstatus(g_conn) != CONNECTION_OK) {
+        PQreset(g_conn);
+    }
+    if (PQstatus(g_conn) != CONNECTION_OK) {
         out->db_ok = 0;
-        PQfinish(conn);
         return -1;
     }
     out->db_ok = 1;
+    PGconn *conn = g_conn;
 
     PGresult *r;
     r = PQexec(conn, "SELECT COUNT(*) FROM \"Participant\"");
@@ -78,11 +103,15 @@ static int fetch_stats(platform_stats *out) {
 
     r = PQexec(conn, "SELECT split_part(version(), ' on ', 1)");
     if (PQresultStatus(r) == PGRES_TUPLES_OK) {
+        /* Round 10 fix (audit item 263): strncpy does not null-
+         * terminate when src length >= dst capacity. Force the
+         * trailing 0 explicitly. */
         strncpy(out->pg_version, PQgetvalue(r, 0, 0), sizeof(out->pg_version) - 1);
+        out->pg_version[sizeof(out->pg_version) - 1] = 0;
     }
     PQclear(r);
 
-    PQfinish(conn);
+    /* Connection stays cached — do NOT call PQfinish. */
 
     time_t now = time(NULL);
     strftime(out->last_check, sizeof(out->last_check), "%H:%M:%S", localtime(&now));
@@ -162,7 +191,34 @@ static void draw_dashboard(WINDOW *win, const platform_stats *s, int paused) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc > 1) g_db_url = argv[1];
+    /* Round 10 fix (audit item 270): respond to --help / -h. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            fprintf(stderr,
+                "Usage: %s [database-url]\n"
+                "  Or set DATABASE_URL in the environment.\n"
+                "Keys: q=quit  r=refresh  p=pause/resume\n",
+                argv[0]);
+            return 0;
+        }
+    }
+
+    /* Round 10 fix (audit items 261, 262, 269): prefer the
+     * environment variable over argv so the conninfo (containing
+     * the database password) does not appear in `ps` output. */
+    const char *env_url = getenv("DATABASE_URL");
+    if (argc > 1) {
+        g_db_url = argv[1];
+    } else if (env_url && env_url[0]) {
+        g_db_url = env_url;
+    }
+
+    /* Round 10 fix (audit item 265): redraw on terminal resize. */
+    struct sigaction sa = { 0 };
+    sa.sa_handler = on_sigwinch;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGWINCH, &sa, NULL);
 
     initscr();
     cbreak();
@@ -182,6 +238,14 @@ int main(int argc, char *argv[]) {
     time_t last_refresh = 0;
 
     while (1) {
+        /* Handle pending resize before drawing. */
+        if (g_resize) {
+            g_resize = 0;
+            endwin();
+            refresh();
+            clear();
+        }
+
         time_t now = time(NULL);
         if (!paused && (now - last_refresh) >= REFRESH_INTERVAL_SEC) {
             fetch_stats(&stats);
@@ -195,6 +259,7 @@ int main(int argc, char *argv[]) {
         if (ch == 'p' || ch == 'P') paused = !paused;
     }
 
+    if (g_conn) PQfinish(g_conn);
     endwin();
     return 0;
 }

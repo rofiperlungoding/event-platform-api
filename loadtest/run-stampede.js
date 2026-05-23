@@ -9,11 +9,36 @@
  * Env: ADMIN_EMAIL, ADMIN_PASSWORD (default admin@intrivia.test / admin123)
  */
 import {Agent, setGlobalDispatcher} from 'undici';
-const N = parseInt(process.argv[2] || '2000');
+
+/* Round 10 fix (audit item 286): validate argv. A typo like
+ * `node run-stampede.js abc` previously made N = NaN and the
+ * loop iterated forever. */
+function parseInt32(s, fallback, name) {
+  const n = parseInt(s, 10);
+  if (!Number.isFinite(n) || n <= 0 || n > 100000) {
+    console.error(`Invalid ${name}: ${s}. Using fallback ${fallback}.`);
+    return fallback;
+  }
+  return n;
+}
+
+const N = parseInt32(process.argv[2] || '2000', 2000, 'n');
 const API = process.argv[3] || 'https://api.rofidoesthings.site';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@intrivia.test';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const RUN_ID = 'r' + Date.now().toString(36);
+
+/* Round 10 fix (audit item 290): redact any error body before logging
+ * so a server-side crash dump that happened to capture user data
+ * does not leak through console output. */
+function redact(body) {
+  if (!body) return '';
+  const s = String(body);
+  return s
+    .replace(/("password"\s*:\s*")[^"]+(")/g, '$1***$2')
+    .replace(/(Bearer\s+)[A-Za-z0-9_:.-]+/g, '$1***')
+    .slice(0, 200);
+}
 
 /* Use undici with a high-concurrency dispatcher. Node's default fetch
  * caps connections per host low, causing spurious "fetch failed" during
@@ -29,6 +54,26 @@ console.log(`\n💥 Orchestrated stampede: ${N} concurrent\n`);
 console.log(`   API:    ${API}`);
 console.log(`   Run id: ${RUN_ID}\n`);
 
+/* Round 10 fix (audit item 288): trap SIGINT so a Ctrl-C in the
+ * middle of a stampede still cleans up the seeded data. Without
+ * this the operator was left with thousands of orphan participants
+ * tagged `dev-stamp-...` that later showed up in the dashboard. */
+let cleanupToken = null;
+process.on('SIGINT', async () => {
+  console.log('\n⚠ SIGINT received — running cleanup before exit');
+  if (cleanupToken) {
+    try {
+      await fetch(`${API}/participants/seed-cleanup`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'Authorization': `Bearer ${cleanupToken}`},
+        body: JSON.stringify({run_id: RUN_ID}),
+      });
+      console.log('  ✓ cleanup ok');
+    } catch (e) { console.error('  cleanup failed:', e.message); }
+  }
+  process.exit(130);
+});
+
 (async () => {
   /* 1. Admin login */
   const lr = await fetch(`${API}/auth/login`, {
@@ -38,6 +83,7 @@ console.log(`   Run id: ${RUN_ID}\n`);
   const ld = await lr.json();
   if (!lr.ok) throw new Error('login: ' + (ld.error || lr.status));
   const token = ld.token;
+  cleanupToken = token;     /* arm SIGINT trap (round 10) */
   console.log('  ✓ admin logged in');
 
   /* 2. Seed N participants + devices */
@@ -154,11 +200,12 @@ console.log(`   Run id: ${RUN_ID}\n`);
   const dup = results.filter(r => r.status === 409);
   const errors = results.filter(r => !r.ok && r.status !== 409);
   const lats = results.map(r => r.latency).sort((a, b) => a - b);
-  const pct = p => lats[Math.floor(lats.length * p / 100)] || 0;
-  const avg = lats.reduce((a, b) => a + b, 0) / lats.length;
+  /* Round 10 fix (audit item 289): handle empty results array. */
+  const pct = p => lats.length ? (lats[Math.floor(lats.length * p / 100)] || 0) : 0;
+  const avg = lats.length ? lats.reduce((a, b) => a + b, 0) / lats.length : 0;
   const errBy = {};
   for (const e of errors) {
-    const k = `${e.status} ${(e.body || '').slice(0, 70)}`;
+    const k = `${e.status} ${redact(e.body).slice(0, 70)}`;
     errBy[k] = (errBy[k] || 0) + 1;
   }
   console.log('━━━ RESULTS ━━━');
@@ -184,7 +231,7 @@ console.log(`   Run id: ${RUN_ID}\n`);
       console.log('\n  First error detail:');
       console.log('    status:', errors[0].status);
       console.log('    latency:', errors[0].latency);
-      console.log('    body:', errors[0].body);
+      console.log('    body:', redact(errors[0].body));
     }
   }
   const goodPct = (ok.length + dup.length) / results.length * 100;

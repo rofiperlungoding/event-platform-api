@@ -24,7 +24,27 @@
  */
 
 import {Agent, setGlobalDispatcher} from 'undici';
-const N = parseInt(process.argv[2] || '2000');
+
+/* Round 10 fix (audit items 286, 290): validate argv and redact
+ * tokens/passwords from any error body before logging. Same helpers
+ * as run-stampede.js. */
+function parseInt32(s, fallback, name) {
+  const n = parseInt(s, 10);
+  if (!Number.isFinite(n) || n <= 0 || n > 100000) {
+    console.error(`Invalid ${name}: ${s}. Using fallback ${fallback}.`);
+    return fallback;
+  }
+  return n;
+}
+function redact(body) {
+  if (!body) return '';
+  return String(body)
+    .replace(/("password"\s*:\s*")[^"]+(")/g, '$1***$2')
+    .replace(/(Bearer\s+)[A-Za-z0-9_:.-]+/g, '$1***')
+    .slice(0, 200);
+}
+
+const N = parseInt32(process.argv[2] || '2000', 2000, 'n');
 const API = process.argv[3] || 'http://192.168.100.67:3001';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@intrivia.test';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
@@ -209,7 +229,7 @@ function pickProfile() {
     console.log(`\n  ❌ FAIL: ${recoverableLost.length} attendee(s) with valid devices lost despite retries.`);
     console.log(`  Sample failures:`);
     for (const r of recoverableLost.slice(0, 5)) {
-      console.log(`    profile=${r.profile} attempts=${r.attempts} status=${r.status} body=${r.body}`);
+      console.log(`    profile=${r.profile} attempts=${r.attempts} status=${r.status} body=${redact(r.body)}`);
     }
   }
 
