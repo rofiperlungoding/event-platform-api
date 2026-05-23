@@ -383,4 +383,16 @@ $('#btn-refresh').addEventListener('click', refresh);
 $('#endpoint-text').textContent = new URL(API).host;
 
 refresh();
-setInterval(refresh, REFRESH_MS);
+/* Pause polling when tab is hidden, resume on focus. Saves cellular
+ * data and avoids the rate-limit bump on browser-tab resume that
+ * audit item 103 warned about. */
+let refreshTimer = setInterval(refresh, REFRESH_MS);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  } else if (!refreshTimer) {
+    refresh();
+    refreshTimer = setInterval(refresh, REFRESH_MS);
+  }
+});

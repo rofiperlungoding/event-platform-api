@@ -49,20 +49,23 @@ input{width:100%;padding:10px 12px;margin-bottom:10px;background:#0f1419;border:
 </head>
 <body>
 <div class="offline-badge" id="offline-badge">OFFLINE</div>
-<h1>📋 Event Check-In</h1>
-<p class="sub">scan QR · works offline</p>
+<h1>📋 Absensi Kegiatan</h1>
+<p class="sub">scan QR · bekerja offline</p>
 
 <div id="status" class="status"></div>
 
 <!-- Auth Phase -->
 <div class="card" id="auth-card">
-  <h2>Login or Register</h2>
-  <input id="a-name" placeholder="Name"/>
+  <h2>Daftar atau Login</h2>
+  <input id="a-name" placeholder="Nama lengkap"/>
   <input id="a-email" placeholder="Email" type="email"/>
-  <input id="a-team" placeholder="Team"/>
-  <input id="a-password" placeholder="Password" type="password"/>
-  <button class="btn btn-primary" onclick="authRegister()">Register & Link Device</button>
-  <button class="btn btn-primary" style="background:#333" onclick="authLogin()">Login</button>
+  <input id="a-team" placeholder="Tim / kelompok"/>
+  <input id="a-password" placeholder="Password (min. 6 karakter)" type="password"/>
+  <button class="btn btn-primary" onclick="authRegister()">Daftar & Tautkan HP</button>
+  <button class="btn btn-primary" style="background:#333" onclick="authLogin()">Sudah punya akun? Login</button>
+  <p class="muted-hint" id="browser-warn" style="display:none;font-size:11px;margin-top:8px;color:#f85149">
+    ⚠ Buka via Chrome / Safari biasa untuk fitur offline penuh. Browser dalam aplikasi (WhatsApp / Instagram) tidak mendukung Service Worker.
+  </p>
 </div>
 
 <!-- Scan Phase -->
@@ -72,10 +75,15 @@ input{width:100%;padding:10px 12px;margin-bottom:10px;background:#0f1419;border:
     <div class="team" id="user-team">—</div>
     <div class="device" id="user-device">—</div>
   </div>
-  <button class="btn btn-scan" id="btn-start-scan" onclick="startScan()">📷 Scan QR to Check In</button>
+  <button class="btn btn-scan" id="btn-start-scan" onclick="startScan()">📷 Scan QR untuk Absen</button>
+  <button class="btn btn-primary" id="btn-manual" style="background:#333" onclick="showManualEntry()">⌨ Masukkan kode manual</button>
+  <div id="manual-entry" class="hidden">
+    <input id="manual-code" placeholder="Kode 8 huruf" style="font-family:var(--mono);text-transform:uppercase;letter-spacing:0.1em" maxlength="100"/>
+    <button class="btn btn-primary" onclick="submitManualCode()">Absen</button>
+  </div>
   <div id="reader"></div>
   <div class="history" id="history">
-    <h3><span>History</span><span class="queue-count" id="queue-count"></span></h3>
+    <h3><span>Riwayat absen</span><span class="queue-count" id="queue-count"></span></h3>
   </div>
 </div>
 
@@ -121,8 +129,15 @@ async function probeOnce(url) {
   try {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 1500);
-    const r = await fetch(`${url}/health`, {signal: ctl.signal, cache: 'no-store'});
+    const r = await fetch(`${url}/health`, {
+      signal: ctl.signal, cache: 'no-store',
+      redirect: 'manual',     // captive portals redirect; manual = we see the response
+    });
     clearTimeout(t);
+    if (r.type === 'opaqueredirect' || (r.status >= 300 && r.status < 400)) {
+      console.warn(`[api] ${url} returned redirect — captive portal?`);
+      return false;
+    }
     if (r.ok) {
       const d = await r.json().catch(() => ({}));
       /* Server clock cross-check (audit item 76): if server time
@@ -180,9 +195,20 @@ let userName = '', userTeam = '';
 let scanner = null;
 let isOnline = navigator.onLine;
 
-// Device ID
+// Device ID — polyfill randomUUID for old browsers (audit item 146)
+function safeRandomUUID() {
+  if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID();
+  /* RFC 4122 v4 fallback using crypto.getRandomValues if present */
+  const bytes = new Uint8Array(16);
+  if (crypto?.getRandomValues) crypto.getRandomValues(bytes);
+  else for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const h = [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+}
 if (!deviceId) {
-  deviceId = 'dev-' + crypto.randomUUID();
+  deviceId = 'dev-' + safeRandomUUID();
   localStorage.setItem('ep_device_id', deviceId);
 }
 
@@ -325,7 +351,30 @@ if ('serviceWorker' in navigator) {
       reg.sync.register('sync-checkins').catch(() => {});
     }
   });
+  /* Listen for SW updated message — show a banner so attendees know
+   * a fresh version is live (audit item 121). */
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data?.type === 'sw-updated') {
+      showStatus('🔄 Versi baru tersedia — refresh halaman.', 'info');
+    }
+  });
 }
+
+// ─── Browser-environment hint (audit items 144, 146) ─────────────────
+(function detectBrowser() {
+  const ua = navigator.userAgent;
+  const inApp =
+    /FBAN|FBAV|Instagram|Line\/|MicroMessenger|Twitter|TikTok|WhatsApp/i.test(ua);
+  const noUUID = typeof crypto?.randomUUID !== 'function';
+  if (inApp || noUUID) {
+    const el = document.getElementById('browser-warn');
+    if (el) {
+      el.style.display = 'block';
+      if (noUUID) el.textContent =
+        '⚠ Browser kamu terlalu lama. Update Chrome / Safari atau buka di browser lain.';
+    }
+  }
+})();
 
 // ─── Auth ───────────────────────────────────────────────────────────────
 (async () => {
@@ -371,19 +420,48 @@ function showScanPhase() {
   updateQueueCount();
 }
 
+/* Translate common server error messages to Indonesian for UX. The
+ * server still emits English (which is convenient for log analysis);
+ * the PWA acts as the user-facing translation layer. Keys are
+ * substring-match so partial messages still translate. */
+const I18N = {
+  'session not found, inactive, or expired': 'Sesi absen sudah berakhir atau belum dibuka. Hubungi panitia.',
+  'already checked in for this session': 'Sudah absen sebelumnya. Tetap dianggap hadir ✓',
+  'device not linked, please register first': 'HP belum terdaftar — silakan daftar dulu.',
+  'invalid signed session code': 'QR ini tidak valid. Pastikan dari panitia resmi.',
+  'rate limit exceeded': 'Terlalu cepat — coba sebentar lagi.',
+  'request body too large': 'Permintaan terlalu besar.',
+  'session_code and device_uuid are required': 'Data tidak lengkap.',
+  'invalid email or password': 'Email atau password salah.',
+  'email already registered': 'Email sudah terdaftar — coba login.',
+  'format email tidak valid': 'Format email tidak valid.',
+  'password minimal 6 karakter': 'Password minimal 6 karakter.',
+  'name, email, team, and password are required': 'Nama, email, tim, dan password wajib diisi.',
+  'missing token': 'Sesi login habis. Silakan login ulang.',
+  'invalid or expired token': 'Sesi login habis. Silakan login ulang.',
+};
+function localiseError(msg) {
+  if (!msg) return 'Terjadi kesalahan.';
+  for (const [k, v] of Object.entries(I18N)) {
+    if (msg.toLowerCase().includes(k.toLowerCase())) return v;
+  }
+  return msg;
+}
+
 async function authRegister() {
-  const name = document.getElementById('a-name').value;
-  const email = document.getElementById('a-email').value;
-  const team = document.getElementById('a-team').value;
+  const name = document.getElementById('a-name').value.trim();
+  const email = document.getElementById('a-email').value.trim();
+  const team = document.getElementById('a-team').value.trim();
   const password = document.getElementById('a-password').value;
-  if (!name || !email || !team || !password) { showStatus('Fill all fields', 'error'); return; }
+  if (!name || !email || !team || !password) { showStatus('Lengkapi semua kolom', 'error'); return; }
+  if (password.length < 6) { showStatus('Password minimal 6 karakter', 'error'); return; }
   try {
     const r = await fetch(`${API}/auth/register`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({name, email, team, password})
     });
     const d = await r.json();
-    if (!r.ok) throw new Error(d.error);
+    if (!r.ok) throw new Error(localiseError(d.error));
     token = d.token;
     localStorage.setItem('ep_token', token);
     localStorage.setItem('ep_name', d.participant.name);
@@ -394,22 +472,22 @@ async function authRegister() {
       method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
       body: JSON.stringify({device_uuid: deviceId, user_agent: navigator.userAgent})
     });
-    showStatus('Registered!', 'success');
+    showStatus('✓ Pendaftaran berhasil!', 'success');
     showScanPhase();
-  } catch(e) { showStatus(e.message, 'error'); }
+  } catch(e) { showStatus(localiseError(e.message), 'error'); }
 }
 
 async function authLogin() {
-  const email = document.getElementById('a-email').value;
+  const email = document.getElementById('a-email').value.trim();
   const password = document.getElementById('a-password').value;
-  if (!email || !password) { showStatus('Enter email & password', 'error'); return; }
+  if (!email || !password) { showStatus('Isi email & password', 'error'); return; }
   try {
     const r = await fetch(`${API}/auth/login`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({email, password})
     });
     const d = await r.json();
-    if (!r.ok) throw new Error(d.error);
+    if (!r.ok) throw new Error(localiseError(d.error));
     token = d.token;
     localStorage.setItem('ep_token', token);
     localStorage.setItem('ep_name', d.participant.name);
@@ -420,14 +498,34 @@ async function authLogin() {
       method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
       body: JSON.stringify({device_uuid: deviceId, user_agent: navigator.userAgent})
     });
-    showStatus('Logged in!', 'success');
+    showStatus('✓ Login berhasil!', 'success');
     showScanPhase();
-  } catch(e) { showStatus(e.message, 'error'); }
+  } catch(e) { showStatus(localiseError(e.message), 'error'); }
+}
+
+/* Show manual code entry form (audit item 104, 144) — fallback when
+ * camera is denied or in-app browser blocks QR access. */
+function showManualEntry() {
+  document.getElementById('manual-entry').classList.remove('hidden');
+  document.getElementById('btn-manual').classList.add('hidden');
+  document.getElementById('manual-code').focus();
+}
+async function submitManualCode() {
+  const raw = document.getElementById('manual-code').value.trim();
+  if (!raw) { showStatus('Masukkan kode dulu', 'error'); return; }
+  /* Manual entry accepts either plain code or signed_code */
+  await processCheckin(raw);
+  document.getElementById('manual-code').value = '';
 }
 
 // ─── Scanner ────────────────────────────────────────────────────────────
 function startScan() {
   document.getElementById('btn-start-scan').classList.add('hidden');
+  if (typeof Html5Qrcode === 'undefined') {
+    showStatus('Library QR belum siap. Cek koneksi atau gunakan input manual.', 'error');
+    document.getElementById('btn-start-scan').classList.remove('hidden');
+    return;
+  }
   scanner = new Html5Qrcode("reader");
   scanner.start(
     { facingMode: "environment" },
@@ -482,27 +580,35 @@ async function onScanSuccess(decoded) {
   document.getElementById('btn-start-scan').classList.remove('hidden');
 
   let data;
-  try { data = JSON.parse(decoded); } catch(e) { showStatus('Invalid QR', 'error'); return; }
+  try { data = JSON.parse(decoded); }
+  catch(e) {
+    /* Maybe the QR contains the bare code or signed_code as plain text */
+    if (/^[A-Za-z0-9]{8}(\.[a-f0-9]{16})?$/.test(decoded.trim())) {
+      data = decoded.trim().includes('.') ? {signed_code: decoded.trim()} : {code: decoded.trim()};
+    } else {
+      showStatus('QR tidak valid. Pastikan dari panitia.', 'error'); return;
+    }
+  }
 
   /* Accept either:
    *   { code: "ABC12345" }            (legacy plain code)
    *   { signed_code: "ABC12345.HEX" } (modern signed payload)
    * The signed payload is verified server-side; we forward it as
    * session_code and the server will reject if the signature is
-   * forged. This is what defends against fake QR phishing
-   * (audit item 62): an attacker printing a QR with a different
-   * code cannot mint a valid signature without the JWT secret. */
+   * forged. */
   const sessionCode = data.signed_code || data.code;
-  if (!sessionCode) { showStatus('Invalid QR format', 'error'); return; }
+  if (!sessionCode) { showStatus('Format QR tidak dikenali', 'error'); return; }
+  await processCheckin(sessionCode);
+}
+
+/* Shared check-in pipeline used by both QR scan and manual entry.
+ * `sessionCode` may be plain `ABC12345` or `ABC12345.SIGHEX`. */
+async function processCheckin(sessionCode) {
+  if (!sessionCode) return;
 
   // Try online first
   if (isOnline) {
     try {
-      /* Use device-keyed quick-checkin: no auth round trip, server resolves
-       * device_uuid → participant in a single SQL CTE. This is the path that
-       * scales to 2000 simultaneous attendees. With smart retry, transient
-       * failures (network blip, tunnel hiccup) auto-recover before the user
-       * even sees an error. */
       const r = await fetchWithRetry(`${API}/attendance/quick-checkin`, {
         method:'POST',
         headers:{'Content-Type':'application/json'},
@@ -510,11 +616,18 @@ async function onScanSuccess(decoded) {
       });
       const d = await r.json();
       if (r.ok) {
-        showStatus('✓ Checked in!', 'success');
+        const inGrace = d.grace === true;
+        showStatus(inGrace
+          ? '✓ Hadir tercatat (toleransi waktu)'
+          : '✓ Hadir tercatat — terima kasih!', 'success');
         addHistoryItem(new Date().toISOString(), true);
         return;
       }
-      if (r.status === 409) { showStatus('Already checked in', 'info'); return; }
+      if (r.status === 409) {
+        /* Already checked in — celebrate, not reject (audit item 152) */
+        showStatus('✓ Sudah absen sebelumnya, tetap dianggap hadir', 'info');
+        return;
+      }
       if (r.status === 401) {
         /* Device not linked — fall back to authenticated checkin which links on the fly */
         const fb = await fetchWithRetry(`${API}/attendance/checkin`, {
@@ -523,16 +636,22 @@ async function onScanSuccess(decoded) {
           body: JSON.stringify({session_code: sessionCode, device_id: deviceId})
         });
         const fd = await fb.json();
-        if (fb.ok) { showStatus('✓ Checked in!', 'success'); addHistoryItem(new Date().toISOString(), true); return; }
-        if (fb.status === 409) { showStatus('Already checked in', 'info'); return; }
-        throw new Error(fd.error || 'Server error');
+        if (fb.ok) {
+          showStatus('✓ Hadir tercatat — terima kasih!', 'success');
+          addHistoryItem(new Date().toISOString(), true);
+          return;
+        }
+        if (fb.status === 409) {
+          showStatus('✓ Sudah absen sebelumnya, tetap dianggap hadir', 'info');
+          return;
+        }
+        throw new Error(fd.error || 'server error');
       }
-      throw new Error(d.error || 'Server error');
+      throw new Error(d.error || 'server error');
     } catch(e) {
-      /* All retries exhausted → queue offline. The queue drains via
-       * /attendance/batch-checkin once the network recovers. */
+      /* All retries exhausted → queue offline */
       await addToQueue(sessionCode);
-      showStatus('📦 Queued — will sync automatically', 'queued');
+      showStatus('📦 Disimpan, akan otomatis tersinkron', 'queued');
       addHistoryItem(new Date().toISOString(), false);
       triggerSync();
       return;
@@ -541,7 +660,7 @@ async function onScanSuccess(decoded) {
 
   // Offline — queue locally
   await addToQueue(sessionCode);
-  showStatus('📦 Saved offline — will sync automatically', 'queued');
+  showStatus('📦 Tersimpan offline — akan tersinkron otomatis', 'queued');
   addHistoryItem(new Date().toISOString(), false);
   triggerSync();
 }

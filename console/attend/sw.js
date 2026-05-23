@@ -1,5 +1,5 @@
 /* Service Worker — offline-first + background sync */
-const CACHE_NAME = 'checkin-v3';
+const CACHE_NAME = 'checkin-v4';
 const STATIC_ASSETS = [
   '/attend/scan.html',
   '/attend/manifest.json',
@@ -15,14 +15,19 @@ self.addEventListener('install', e => {
   self.skipWaiting();
 });
 
-// Activate: clean old caches
+// Activate: clean old caches and tell clients we have a new version
 self.addEventListener('activate', e => {
-  e.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
-    )
-  );
-  self.clients.claim();
+  e.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)));
+    await self.clients.claim();
+    /* Notify all clients so the page can show a "refresh available"
+     * banner without forcing a reload. Mitigates audit item 121. */
+    const clients = await self.clients.matchAll({ type: 'window' });
+    for (const client of clients) {
+      client.postMessage({ type: 'sw-updated', cacheName: CACHE_NAME });
+    }
+  })());
 });
 
 // Fetch: serve from cache first, fallback to network

@@ -1010,7 +1010,7 @@ static void handle_health_detailed(int fd) {
         "\"database\":{\"status\":\"%s\",\"latency_ms\":%ld}},"
         "\"uptime_seconds\":%ld,\"service_uptime_seconds\":%ld,"
         "\"deploy\":%s,\"backup\":%s,"
-        "\"version\":\"0.5.0-c\",\"node_version\":\"native-c\"}",
+        "\"version\":\"0.6.0-c\",\"node_version\":\"native-c\"}",
         overall, api_ms, db_status, db_ms,
         (long)(time(NULL) - start_time),
         (long)(time(NULL) - service_start_time),
@@ -1378,6 +1378,25 @@ static void handle_auth_register(int fd, const char *body) {
         return;
     }
 
+    /* Minimal email syntax check (audit item 110, 139) — catches the
+     * most common typo class: missing @, missing TLD, both blank. */
+    const char *at = strchr(email, '@');
+    const char *dot = at ? strchr(at, '.') : NULL;
+    if (!at || !dot || at == email || *(at + 1) == 0 || *(dot + 1) == 0) {
+        send_json(fd, 400, "Bad Request",
+            "{\"error\":\"format email tidak valid\"}");
+        return;
+    }
+
+    /* Password minimum length — short bcrypt-style check. Audit
+     * item 100: prevents trivial 1-character passwords from sneaking
+     * through new admin onboarding. */
+    if (strlen(password) < 6) {
+        send_json(fd, 400, "Bad Request",
+            "{\"error\":\"password minimal 6 karakter\"}");
+        return;
+    }
+
     PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
@@ -1669,6 +1688,27 @@ static void handle_session_create(int fd, const char *headers) {
     PGconn *conn = db_acquire();
     if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
 
+    /* Auto-close any other active session this admin owns. Mitigates
+     * audit item 133 — admins forget to stop yesterday's session and
+     * attendees end up checked into the wrong one. We close per
+     * admin (created_by) so multiple events can run concurrently as
+     * long as they have different operators. */
+    {
+        const char *cp[1] = { (const char *)NULL };
+        char id_buf[16]; snprintf(id_buf, sizeof(id_buf), "%d", user_id);
+        cp[0] = id_buf;
+        PGresult *cr = PQexecParams(conn,
+            "UPDATE \"Session\" SET active = false "
+            "WHERE created_by = $1 AND active = true",
+            1, NULL, cp, NULL, NULL, 0);
+        const char *closed = PQcmdTuples(cr);
+        if (closed && atoi(closed) > 0) {
+            fprintf(stderr, "[session.create] auto-closed %s prior active session(s) for admin %d\n",
+                    closed, user_id);
+        }
+        PQclear(cr);
+    }
+
     char id_str[16], expiry_str[32];
     snprintf(id_str, sizeof(id_str), "%d", user_id);
     time_t exp_time = time(NULL) + SESSION_EXPIRY;
@@ -1936,15 +1976,19 @@ static void handle_attendance_quick_checkin(int fd, const char *body) {
     }
 
     /* Single CTE: device → participant + session → insert.
-     * If device or session missing/expired, RETURNING is empty → handled below.
-     * UNIQUE(participant_id, session_id) gives 409 on duplicate. */
+     * Grace window of 5 minutes (SESSION_GRACE_SEC) past `expires_at`
+     * so late-comer attendees aren't rejected — mitigates audit
+     * item 131. */
     const char *params[2] = { device_uuid, session_code };
     PGresult *r = PQexecParams(conn,
         "WITH d AS (SELECT participant_id FROM \"Device\" WHERE device_uuid = $1), "
-        "     s AS (SELECT id FROM \"Session\" WHERE code = $2 AND active = true AND expires_at > NOW()) "
+        "     s AS (SELECT id, expires_at < NOW() AS in_grace FROM \"Session\" "
+        "          WHERE code = $2 AND active = true "
+        "          AND expires_at > NOW() - INTERVAL '5 minutes') "
         "INSERT INTO \"Attendance\" (participant_id, session_id, device_id, \"checkedInAt\") "
         "SELECT d.participant_id, s.id, $1, NOW() FROM d, s "
-        "RETURNING id, participant_id, session_id, \"checkedInAt\"",
+        "RETURNING id, participant_id, session_id, \"checkedInAt\", "
+        "(SELECT in_grace FROM s LIMIT 1) AS in_grace",
         2, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
@@ -1980,11 +2024,15 @@ static void handle_attendance_quick_checkin(int fd, const char *body) {
         return;
     }
 
-    char buf[256];
+    char buf[300];
+    /* `in_grace` is the 5th column from the RETURNING; PG returns
+     * "t"/"f" for booleans. */
+    const char *grace = (PQnfields(r) > 4) ? PQgetvalue(r, 0, 4) : "f";
     snprintf(buf, sizeof(buf),
-        "{\"id\":%s,\"participant_id\":%s,\"session_id\":%s,\"checkedInAt\":\"%s\"}",
+        "{\"id\":%s,\"participant_id\":%s,\"session_id\":%s,\"checkedInAt\":\"%s\",\"grace\":%s}",
         PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1),
-        PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3));
+        PQgetvalue(r, 0, 2), PQgetvalue(r, 0, 3),
+        (grace[0] == 't') ? "true" : "false");
     PQclear(r); db_release(conn);
     __sync_fetch_and_add(&m_checkins_ok, 1);
     send_json(fd, 201, "Created", buf);
@@ -2446,6 +2494,91 @@ static void handle_events_list(int fd) {
 /* Accepts CSV body with header line: name,email,team
  * Returns JSON summary: {"created":N, "skipped":M, "errors":[...]}    */
 
+/* Admin endpoint: reset another participant's password and/or email.
+ * Mitigates audit items 139, 140 — there is no self-service forgot
+ * password flow. The admin acts as the recovery channel.
+ *
+ * Body: { "participant_id": 5, "new_password": "...", "new_email": "..." }
+ * Either field may be omitted. The new password is hashed via PBKDF2;
+ * the email update fails with 409 on uniqueness violation.
+ */
+static void handle_admin_participant_reset(int fd, const char *headers, const char *body, uint32_t client_ip) {
+    const char *token = extract_bearer(headers);
+    if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
+    char role[32];
+    int admin_id = verify_token(token, role);
+    if (admin_id < 0) { send_json(fd, 401, "Unauthorized", "{\"error\":\"invalid or expired token\"}"); return; }
+    if (strcmp(role, "admin") != 0) { send_json(fd, 403, "Forbidden", "{\"error\":\"admin access required\"}"); return; }
+
+    char pid_str[16] = "", new_password[128] = "", new_email[256] = "";
+    EXTRACT_JSON(body, "participant_id", pid_str, sizeof(pid_str));
+    EXTRACT_JSON(body, "new_password", new_password, sizeof(new_password));
+    EXTRACT_JSON(body, "new_email", new_email, sizeof(new_email));
+    if (!pid_str[0] || (!new_password[0] && !new_email[0])) {
+        send_json(fd, 400, "Bad Request",
+            "{\"error\":\"participant_id and at least one of new_password / new_email required\"}");
+        return;
+    }
+
+    PGconn *conn = db_acquire();
+    if (!conn) { send_json(fd, 500, "Internal Server Error", "{\"error\":\"db connection failed\"}"); return; }
+
+    /* Build dynamic UPDATE; both fields handled by parameterised SQL */
+    char hashed[128] = "";
+    if (new_password[0]) hash_password(hashed, sizeof(hashed), new_password);
+
+    PGresult *r;
+    if (new_password[0] && new_email[0]) {
+        const char *params[3] = { hashed, new_email, pid_str };
+        r = PQexecParams(conn,
+            "UPDATE \"Participant\" SET password_hash = $1, email = $2, "
+            "\"updatedAt\" = NOW() WHERE id = $3::int "
+            "RETURNING id, email",
+            3, NULL, params, NULL, NULL, 0);
+    } else if (new_password[0]) {
+        const char *params[2] = { hashed, pid_str };
+        r = PQexecParams(conn,
+            "UPDATE \"Participant\" SET password_hash = $1, "
+            "\"updatedAt\" = NOW() WHERE id = $2::int "
+            "RETURNING id, email",
+            2, NULL, params, NULL, NULL, 0);
+    } else {
+        const char *params[2] = { new_email, pid_str };
+        r = PQexecParams(conn,
+            "UPDATE \"Participant\" SET email = $1, "
+            "\"updatedAt\" = NOW() WHERE id = $2::int "
+            "RETURNING id, email",
+            2, NULL, params, NULL, NULL, 0);
+    }
+
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+        const char *sqlstate = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+        PQclear(r); db_release(conn);
+        if (sqlstate && strcmp(sqlstate, "23505") == 0) {
+            send_json(fd, 409, "Conflict", "{\"error\":\"email already in use\"}");
+        } else {
+            send_json(fd, 500, "Internal Server Error", "{\"error\":\"reset failed\"}");
+        }
+        return;
+    }
+    if (PQntuples(r) == 0) {
+        PQclear(r); db_release(conn);
+        send_json(fd, 404, "Not Found", "{\"error\":\"participant not found\"}");
+        return;
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"id\":%s,\"email\":\"%s\",\"reset\":\"ok\"}",
+        PQgetvalue(r, 0, 0), PQgetvalue(r, 0, 1));
+    PQclear(r); db_release(conn);
+    char meta[128];
+    snprintf(meta, sizeof(meta), "password=%s,email=%s",
+        new_password[0] ? "changed" : "kept",
+        new_email[0] ? "changed" : "kept");
+    audit_log(admin_id, NULL, "participant.reset", "participant", pid_str, client_ip, meta);
+    send_json(fd, 200, "OK", buf);
+}
+
 static void handle_participants_bulk(int fd, const char *headers, const char *body) {
     const char *token = extract_bearer(headers);
     if (!token) { send_json(fd, 401, "Unauthorized", "{\"error\":\"missing token\"}"); return; }
@@ -2526,6 +2659,21 @@ static void handle_participants_bulk(int fd, const char *headers, const char *bo
         const char *email = fields[1];
         const char *team  = fields[2];
         const char *password = fields[3] ? fields[3] : "default-pw-please-change";
+
+        /* Minimal email syntax check (audit item 110) — reject lines
+         * with no '@' or no '.' before validation hits the DB. The
+         * server is not pretending to do RFC 5322; we only catch the
+         * common typo `rofi@gmial.com` once it's been corrected, but
+         * we do reject obvious garbage like `not-an-email` early. */
+        const char *at = strchr(email, '@');
+        const char *dot = at ? strchr(at, '.') : NULL;
+        if (!at || !dot || at == email || *(at + 1) == 0 || *(dot + 1) == 0) {
+            if (errors.len > 1) sb_append(&errors, ",");
+            sb_appendf(&errors, "{\"line\":%d,\"email\":\"%s\",\"error\":\"invalid email format\"}",
+                line_num, email);
+            skipped++;
+            continue;
+        }
 
         const char *role_str = "participant";
         char hashed[128];
@@ -2739,19 +2887,31 @@ static void handle_attendance_export(int fd, const char *headers, const char *id
         return;
     }
 
-    /* Build CSV body */
+    /* Build CSV body. RFC 4180-compliant escape: wrap every field
+     * in quotes, double any internal quotes. Mitigates audit
+     * items 124, 142 — names like O'Brien or "Doe, John" no longer
+     * break the file. */
     strbuf csv; sb_init(&csv, 4096);
     sb_append(&csv, "id,name,email,team,device_id,checked_in_at\r\n");
+
+    char esc[1024];
     int rows = PQntuples(r);
     for (int i = 0; i < rows; i++) {
-        /* CSV escape: wrap in quotes if value contains comma/quote/newline */
-        sb_appendf(&csv, "%s,\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\r\n",
-            PQgetvalue(r, i, 0),
-            PQgetvalue(r, i, 1),
-            PQgetvalue(r, i, 2),
-            PQgetvalue(r, i, 3),
-            PQgetvalue(r, i, 4),
-            PQgetvalue(r, i, 5));
+        sb_appendf(&csv, "%s", PQgetvalue(r, i, 0));   /* id is numeric, no escape */
+        for (int col = 1; col <= 5; col++) {
+            const char *v = PQgetvalue(r, i, col);
+            int j = 0;
+            esc[j++] = ',';
+            esc[j++] = '"';
+            for (const char *p = v; *p && j < (int)sizeof(esc) - 4; p++) {
+                if (*p == '"') { esc[j++] = '"'; esc[j++] = '"'; }
+                else esc[j++] = *p;
+            }
+            esc[j++] = '"';
+            esc[j] = 0;
+            sb_append(&csv, esc);
+        }
+        sb_append(&csv, "\r\n");
     }
     PQclear(r); db_release(conn);
 
@@ -3201,6 +3361,8 @@ static void handle_request(int fd, const char *method, const char *path,
         if (strcmp(path, "/events") == 0) { handle_event_create(fd, headers, body); return; }
         /* Bulk participant import */
         if (strcmp(path, "/participants/bulk") == 0) { handle_participants_bulk(fd, headers, body); return; }
+        /* Admin password / email reset */
+        if (strcmp(path, "/admin/reset-participant") == 0) { handle_admin_participant_reset(fd, headers, body, 0); return; }
         /* Stampede load-test seed (admin only) */
         if (strcmp(path, "/participants/seed-stamp") == 0) { handle_participants_seed_stamp(fd, headers, body); return; }
         if (strcmp(path, "/participants/seed-cleanup") == 0) { handle_participants_seed_cleanup(fd, headers, body); return; }

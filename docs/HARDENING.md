@@ -579,3 +579,195 @@ Mitigated. `/health/detailed` already reports `version` (now
 | Admin-only DELETE                     | `DELETE /participants/123` without token → 401      |
 | Backup info in detailed health        | `curl /health/detailed | jq .backup`                |
 | Readiness during shutdown             | `pm2 stop event-server` then `curl /health/ready` → 503 |
+
+
+---
+
+# Round 5 — Most-Common Real-World Failures
+
+Round 5 focuses on what *actually breaks* at every campus event,
+distinct from the edge cases of round 4. The targets here come from
+post-mortem patterns: late comers, wrong-session-broadcast, attendees
+on in-app browsers, OPPO/Samsung battery-saver wiping the SW, names
+with apostrophes and commas, and the ever-present "saya udah absen
+belum" anxiety.
+
+## Summary
+
+| #   | Risk                                              | Status     |
+| --- | ------------------------------------------------- | ---------- |
+| 131 | Late comers — session expired                     | Mitigated  |
+| 132 | Re-entry pattern shows error tone                 | Mitigated  |
+| 133 | Old session never closed                          | Mitigated  |
+| 134 | Admin paste-error on session code                 | Documented |
+| 135 | Device UUID stale after factory reset             | Documented |
+| 136 | Wi-Fi captive portal mid-session                  | Mitigated  |
+| 137 | Battery saver kills SW on attendee phone          | Documented |
+| 138 | Multi-session day forget-to-stop                  | Mitigated  |
+| 139 | Email typo at registration                        | Mitigated  |
+| 140 | No forgot-password flow                           | Mitigated  |
+| 141 | Proxy attendance via shared device                | Documented |
+| 142 | Names with apostrophes / commas                   | Mitigated  |
+| 143 | Two participants same name                        | Documented |
+| 144 | In-app browser (WhatsApp / Instagram)             | Mitigated  |
+| 145 | iOS Safari ITP wipes IndexedDB                    | Documented |
+| 146 | Old Android no `crypto.randomUUID`                | Mitigated  |
+| 147 | QR rotates mid-scan                               | Mitigated  |
+| 148 | Sun glare / dim screen                            | Out of scope |
+| 149 | Printed QR ink-saver                              | Out of scope |
+| 150 | Admin closes browser tab                          | Mitigated  |
+| 151 | Error messages all in English                     | Mitigated  |
+| 152 | "Already checked in" tone is rejection            | Mitigated  |
+| 153 | No "kapan saya absen" view                        | Mitigated  |
+| 154 | Loading spinner forever                           | Tracked    |
+| 155 | Multi-device per person                           | Documented |
+| 156–160 | Operational / cosmetic                        | Out of scope |
+| 161–170 | Nice-to-have                                  | Tracked    |
+
+## Mitigations Detail (Round 5)
+
+### 131. Late-comer grace window
+
+Mitigated. The session lookup in `quick-checkin` now accepts an
+expiry within the last 5 minutes (`SESSION_GRACE_SEC`). The response
+includes a `grace: true` field so the PWA can announce
+"✓ Hadir tercatat (toleransi waktu)" instead of a hard 404.
+
+### 132, 152. Re-entry tone
+
+Mitigated. `409 Conflict` ("already checked in") is now framed as
+success in the PWA: "✓ Sudah absen sebelumnya, tetap dianggap hadir".
+Attendees coming back from the toilet no longer think the system
+rejected them.
+
+### 133, 138. Auto-close prior sessions
+
+Mitigated. `POST /sessions/create` now closes any prior active
+session owned by the same admin in a single transaction before
+inserting the new one. Multi-session days work without operator
+remembering to "stop" the morning session.
+
+### 136. Captive portal detection
+
+Mitigated. The PWA endpoint probe uses `redirect: 'manual'`. A
+captive portal that 302-redirects to a login page is detected as
+`opaqueredirect` and that endpoint is rejected; the PWA falls back
+to the next candidate (tunnel, then offline queue).
+
+### 139, 140. Forgot password flow
+
+Mitigated. New endpoint `POST /admin/reset-participant` accepts
+`{ participant_id, new_password, new_email }` (either field
+optional). Audit-logged with metadata. Admins are the human
+recovery channel; self-service forgot-password is out of scope for
+a campus event.
+
+### 142, 124. CSV with apostrophes and commas
+
+Mitigated. The attendance export now follows RFC 4180 strict:
+every field wrapped in quotes, internal quotes doubled. Names like
+`O'Brien` and `"Doe, John"` round-trip cleanly through Excel and
+Google Sheets.
+
+### 144, 146. Browser environment
+
+Mitigated. The PWA detects in-app browsers (WhatsApp / Instagram /
+Line / WeChat / TikTok / Twitter) and the absence of
+`crypto.randomUUID` and shows a one-line warning at the top of the
+auth card. The UUID polyfill uses `getRandomValues` so device
+identity still works on Android 7.
+
+### 147. QR rotates mid-scan
+
+Mitigated. The signed-code (`<8-char>.<16-hex>`) is generated from
+the current code, but the PWA submits the bare 8-character code
+extracted from the signature; the server's session lookup is
+keyed on the bare code, which lives until `expires_at`. A scan that
+crossed the rotation boundary is therefore valid as long as the
+8-character code was current at submit time — and the
+`SESSION_REFRESH=30s` extension keeps the previous code alive long
+enough for any in-flight scan to land.
+
+### 110, 139. Email format check
+
+Mitigated. Both `POST /auth/register` and `POST /participants/bulk`
+now reject lines without `@` + TLD. The validation is intentionally
+minimal (no full RFC 5322) — it catches `not-an-email`, blank
+strings, and `foo@bar` (no dot), which covers the pragmatic typo
+class.
+
+### 100, 139. Password length
+
+Mitigated. `POST /auth/register` rejects passwords shorter than 6
+characters with an Indonesian-language 400 response.
+
+### 121. SW update notification
+
+Mitigated. The Service Worker `activate` handler posts
+`{ type: 'sw-updated' }` to all open clients. The PWA listens and
+shows "🔄 Versi baru tersedia — refresh halaman." Status banner.
+
+### 150, 103. Dashboard polling on hidden tab
+
+Mitigated. `document.addEventListener('visibilitychange', ...)` in
+`console/app.js` clears the refresh interval when the tab is
+backgrounded and restarts it on focus. Saves bandwidth and avoids
+the rate-limit spike audit item 103 warned about.
+
+### 151. i18n shim
+
+Mitigated. The PWA translates server error strings via a small
+substring-match table (`I18N`). Keys cover the most common error
+paths: session expired, already checked in, device not linked,
+invalid QR, rate limit, format errors. The server still emits
+English (helpful for log aggregation); the PWA is the user-facing
+translation layer.
+
+### 134. Admin paste error
+
+Documented. The admin UI's "Refresh QR" rotates the code every
+30 s; manual paste is not the intended workflow. For events that
+broadcast a code on Slack/WA, operators are advised to paste the
+**signed_code** (with the `.HEX` suffix) which is forge-resistant
+even if a character is dropped.
+
+### 135. Stale device after factory reset
+
+Documented. `POST /device/link` is idempotent on `device_uuid` so a
+new UUID after factory reset just adds a new row. The old row is
+left in place but harmless — it can never check-in to a future
+session because the participant's new device produces the new UUID.
+Cleanup is a future bulk job; not in scope for a single event.
+
+### 137, 145. Battery saver / iOS ITP
+
+Documented. The opportunistic 15-second drain (R3) plus the
+`window.online` event listener keep the queue draining as long as
+the tab is visible. iOS ITP wipes IndexedDB after 7 days of no
+interaction; for a single-day event this is irrelevant. The
+operational runbook reminds attendees to keep the tab open during
+the event.
+
+### 154. Loading spinner forever
+
+Tracked. `fetchWithRetry` already has a 6-second per-attempt
+timeout and retries up to 5 times; the worst case is ~30 seconds
+before the queue path takes over. A visual progress bar is a
+future polish item.
+
+## Verification Matrix (Round 5)
+
+| Capability                               | Test                                                   |
+| ---------------------------------------- | ------------------------------------------------------ |
+| Late-comer grace                         | Create session, wait 5 minutes, scan → 201 with `grace: true` |
+| Auto-close prior session                 | Admin creates two sessions → first becomes `active=false` |
+| Re-entry friendly                        | Scan twice → second shows "Sudah absen sebelumnya"     |
+| Manual code entry                        | Tap "⌨ Masukkan kode manual", type code, hit Absen     |
+| Captive portal detected                  | Connect to a portal-protected Wi-Fi, scan → falls back to tunnel |
+| In-app browser warning                   | Open the PWA from inside WhatsApp → red warning visible |
+| Old-Android UUID polyfill                | Browser without `crypto.randomUUID` → device link works |
+| CSV export RFC-4180                      | Bulk import a participant with name `Doe, John` → CSV opens cleanly in Excel |
+| Email validation                         | Register with `notanemail` → 400 in Indonesian        |
+| Admin password reset                     | `POST /admin/reset-participant {participant_id:5,new_password:"newpass"}` |
+| SW update notification                   | Bump `CACHE_NAME`, redeploy, watch the banner appear   |
+| Indonesian error tone                    | Trigger any error → message comes back in Bahasa       |
