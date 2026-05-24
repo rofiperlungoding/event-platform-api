@@ -37,7 +37,11 @@ jobs:
 
       - name: Compile server (-Wall -Wextra)
         run: |
+          PG_INC=$(pg_config --includedir)
+          PG_LIB=$(pg_config --libdir)
+          echo "Using PG headers from $PG_INC, libs from $PG_LIB"
           cc -O2 -Wall -Wextra -Wno-unused-parameter \
+             -I"$PG_INC" -L"$PG_LIB" \
              -o event-server server.c -lpq
 
       - name: Compile admin TUI
