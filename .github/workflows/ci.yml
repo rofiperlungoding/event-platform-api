@@ -47,7 +47,9 @@ jobs:
       - name: Compile admin TUI
         run: |
           sudo apt-get install -y libncurses-dev
-          cd tui && make
+          PG_INC=$(pg_config --includedir)
+          PG_LIB=$(pg_config --libdir)
+          cd tui && CFLAGS="-O2 -Wall -I$PG_INC" LDFLAGS="-L$PG_LIB -lpq -lncurses" make
 
       - name: Validate shell script syntax
         run: |
