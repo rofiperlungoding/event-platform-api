@@ -32,6 +32,14 @@
  *     wildcard `*` only when the variable is unset (development).
  */
 
+/* Feature-test macros — must come before any system header so glibc
+ * exposes strcasestr, sigaction with SA_RESTART, MAP_ANONYMOUS, and
+ * the rest of the GNU/POSIX surface this file relies on. Termux
+ * (bionic) is permissive and works without these defines, but
+ * stock glibc on Ubuntu requires them. Keep them at the very top. */
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

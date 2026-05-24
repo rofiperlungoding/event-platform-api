@@ -11,6 +11,21 @@ jobs:
     name: Build & Validate
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: rofi
+          POSTGRES_PASSWORD: devsecret
+          POSTGRES_DB: eventplatform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rofi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,17 +33,73 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libpq-dev
+          sudo apt-get install -y build-essential libpq-dev postgresql-client jq shellcheck
 
-      - name: Compile server
-        run: cc -O2 -Wall -o event-server server.c -lpq
+      - name: Compile server (-Wall -Wextra)
+        run: |
+          cc -O2 -Wall -Wextra -Wno-unused-parameter \
+             -o event-server server.c -lpq
 
-      - name: Validate shell scripts
+      - name: Compile admin TUI
+        run: |
+          sudo apt-get install -y libncurses-dev
+          cd tui && make
+
+      - name: Validate shell script syntax
         run: |
           for f in deploy/*.sh; do
-            bash -n "$f" || exit 1
+            bash -n "$f" || { echo "syntax error in $f"; exit 1; }
           done
-          echo "All shell scripts have valid syntax."
+          echo "All ${HOME} shell scripts have valid syntax."
+
+      - name: Shellcheck (warning level)
+        run: |
+          # Run shellcheck but don't fail the build on style warnings
+          for f in deploy/*.sh; do
+            shellcheck -S warning "$f" || echo "  (warnings in $f)"
+          done
+
+      - name: Apply migrations
+        env:
+          PGPASSWORD: devsecret
+        run: |
+          for f in migrations/[0-9][0-9][0-9]_*.sql; do
+            echo "applying $f"
+            psql -h 127.0.0.1 -U rofi -d eventplatform -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Smoke test (start, /health, /metrics, stop)
+        env:
+          PGPASSWORD: devsecret
+        run: |
+          mkdir -p console
+          PORT=4099 \
+          DATABASE_URL=postgresql://rofi:devsecret@127.0.0.1:5432/eventplatform \
+          JWT_SECRET=ci-test-secret \
+          WEBHOOK_SECRET=ci-deploy-secret \
+          STATIC_DIR=$PWD/console \
+          WORKERS=2 \
+          ./event-server > server.log 2>&1 &
+          SERVER_PID=$!
+          # Wait for listener
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            if curl -sf http://127.0.0.1:4099/health > /dev/null; then break; fi
+          done
+          curl -sf http://127.0.0.1:4099/health | tee /dev/stderr | grep -q '"status":"ok"'
+          curl -sf http://127.0.0.1:4099/metrics | grep -q eventplatform_requests_total
+          curl -sf http://127.0.0.1:4099/health/detailed | grep -q '"version":"0.7.2-c"'
+          # Round 8: HSTS header present
+          curl -sIf http://127.0.0.1:4099/health | grep -qi 'strict-transport-security'
+          # Round 6: Content-Length overflow → 413
+          code=$(printf 'POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 99999999999999999999\r\n\r\n' \
+                 | timeout 3 nc 127.0.0.1 4099 2>/dev/null | head -1 || true)
+          echo "$code" | grep -q '413' || { echo "expected 413, got: $code"; exit 1; }
+          # Clean stop
+          kill -TERM "$SERVER_PID" || true
+          wait "$SERVER_PID" 2>/dev/null || true
+          echo "smoke test passed"
+          tail -50 server.log
 
       - name: Verify binary
         run: |
